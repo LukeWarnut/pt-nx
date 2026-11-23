@@ -1,4 +1,5 @@
 #include "game/stage_manager.h"
+#include "engine/core/trail.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -186,7 +187,12 @@ void StageManager::StartPrefetch(const std::string& fpk_path) {
     for (const auto& [geom_file, lines] : line_cache_) {
         known->geoms.insert(geom_file);
     }
-    prefetch_ = std::async(std::launch::async, [&vfs = vfs_, fpk_path, known] { return Parse(vfs, fpk_path, known.get()); });
+    prefetch_ = std::async(std::launch::async, [&vfs = vfs_, fpk_path, known] {
+        TrailF("prefetch: parsing %.80s", fpk_path.c_str());
+        auto parsed = Parse(vfs, fpk_path, known.get());
+        Trail("prefetch: done");
+        return parsed;
+    });
 }
 
 void StageManager::DropPrefetch() {
@@ -360,6 +366,16 @@ void StageManager::RequestUnload(const std::string& label) {
 }
 
 void StageManager::Update() {
+#ifdef __SWITCH2__
+    for (auto it = quarantine_.begin(); it != quarantine_.end();) {
+        if (std::chrono::steady_clock::now() - it->first >= std::chrono::seconds(20)) {
+            LogInfo("stage: {} (id {}) freed, 20 s after its unload", it->second->label, it->second->id);
+            it = quarantine_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+#endif
     if (!deferred_prefetch_.empty() && !CollisionBuildRunning()) {
         const std::string next = std::move(deferred_prefetch_);
         deferred_prefetch_.clear();
@@ -528,7 +544,12 @@ void StageManager::Unload(std::unique_ptr<Stage> stage) {
         on_unloading(*stage);
     }
     LogInfo("stage: {} (id {}, {}) unloaded", stage->label, stage->id, stage->package_path);
+#ifdef __SWITCH2__
+    LogInfo("stage: {} (id {}) kept in memory for 20 s", stage->label, stage->id);
+    quarantine_.emplace_back(std::chrono::steady_clock::now(), std::move(stage));
+#else
     stage.reset();
+#endif
     MarkVisualsDirty();
     MarkCollisionDirty();
 }
@@ -853,7 +874,9 @@ void StageManager::StartCollisionBuild() {
     PendingCollision* pending = pending_collision_.get();
     pending->worker = std::thread([pending, entries = CollisionEntries()] {
         const auto start = std::chrono::steady_clock::now();
+        Trail("collision worker: building");
         BuildWorlds(entries, pending->world, &pending->lines, &pending->reflections, pending->owners);
+        Trail("collision worker: done");
         pending->milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     });
 }

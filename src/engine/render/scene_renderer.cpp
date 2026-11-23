@@ -1,4 +1,5 @@
 #include "engine/render/scene_renderer.h"
+#include "engine/core/trail.h"
 #include "engine/render/smaa_tables.h"
 
 #include <thread>
@@ -27,7 +28,11 @@ void BuildThread::Start(std::function<void()> fn) {
     Join();
     fn_ = std::move(fn);
 #ifdef PT_SWITCH
-    handle_ = pt_switch_thread_start([](void* self) { static_cast<BuildThread*>(self)->fn_(); }, this, 1u << 20);
+    handle_ = pt_switch_thread_start([](void* self) {
+        Trail("build thread: running (pipeline build)");
+        static_cast<BuildThread*>(self)->fn_();
+        Trail("build thread: finished");
+    }, this, 1u << 20);
 #else
     handle_ = new std::thread([this] { fn_(); });
 #endif

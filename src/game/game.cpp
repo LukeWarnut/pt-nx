@@ -1,4 +1,5 @@
 #include "game/game.h"
+#include "engine/core/trail.h"
 #include "game/archive.h"
 #include "game/loop_browser.h"
 
@@ -223,12 +224,15 @@ void Game::Update(float dt, const InputState& pad_input) {
         prefetch_loads_ = stages_.LoadCount();
         stages_.PrefetchMazeFor(prefetch_floor_);
     }
+    Trail("game: stages");
     stages_.Update();
     UpdateGamePlus();
     UpdateGamePlusSounds();
     UpdateGamePlusDemos();
     messages_.Dispatch();
+    Trail("game: demos");
     demos_.Update(dt);
+    Trail("game: demos done");
     messages_.Dispatch();
     constexpr uint64_t kCollisionBuildTicks = 30;
     if (stages_.CollisionBuildRunning() && frame_ >= collision_take_frame_) {
@@ -269,6 +273,7 @@ void Game::Update(float dt, const InputState& pad_input) {
         context.invert_y = options_.invert_y;
         context.peephole_theater = nazo_.IsPeepholeTheaterActive();
         if (!demo_control) {
+            Trail("game: player");
             player_.Update(dt, input, collision_, context);
             zoom_fell_ = zoom_fell_ || player_.ZoomFalling();
         }
@@ -295,6 +300,7 @@ void Game::Update(float dt, const InputState& pad_input) {
         }
         trap_dt_ += dt;
         if ((demo_control ? game_frame_tick_ : player_.FrameEnds()) && (!config_.theater || theater_.traps)) {
+            Trail("game: traps");
             traps_.Update(trap_dt_);
             trap_dt_ = 0.0f;
         }
@@ -305,7 +311,9 @@ void Game::Update(float dt, const InputState& pad_input) {
         objects_.HideRecordsWithoutLocator();
         locators_dirty_ = false;
     }
+    Trail("game: objects");
     objects_.Update(dt);
+    Trail("game: effects");
     effects_.Update(dt);
     UpdateHandyTarget(dt);
     UpdateHandyReflection(dt);
@@ -314,7 +322,9 @@ void Game::Update(float dt, const InputState& pad_input) {
         const Camera camera = GetCamera();
         audio_->SetListener(camera.position, camera.Forward(), camera.Up());
         audio_->SetRtpc("player_direction", std::fmod(glm::degrees(player_.CameraFoxYaw()) + 360.0f, 360.0f));
+        Trail("game: audio update");
         audio_->Update(dt);
+        Trail("game: audio update done");
     }
 }
 

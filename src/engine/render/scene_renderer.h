@@ -253,6 +253,8 @@ public:
     bool RayTracingSupported(std::string& reason) const;
     void SetVrEye(int eye) { vr_eye_ = eye; }
 
+    // logs how far the GPU got in a frame's scene work (the timestamps written so far), for a frame that has not finished: Renderer::on_late_frame
+    void LogGpuProgress(uint32_t frame_index);
 private:
     struct FrameSlot {
         vk::Buffer frame_data;
@@ -262,6 +264,7 @@ private:
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorSet post_set = VK_NULL_HANDLE;
         VkQueryPool queries = VK_NULL_HANDLE;
+        uint32_t stamps_written = 0;  // which timestamps this slot's frame recorded (bit per index)
         VkQueryPool upscale_queries = VK_NULL_HANDLE;
         bool upscale_timed = false;
         uint32_t luminance_groups = 0;
@@ -349,7 +352,10 @@ private:
     bool EnsureAoTargets();
     bool EnsureShadowTarget();
     void RecordRtAmbientOcclusion(VkCommandBuffer cmd, const ViewSetup& view);
-    void RecordLighting(VkCommandBuffer cmd, const ViewSetup& view);
+    // stages: which parts to record (kLightingProbes | kLightingHalfLights | kLightingResolve); the choices between them are made the same
+    // way whatever is recorded, so the parts can go to separate submissions in order (SettleExposure does, to name a failing one)
+    static constexpr uint32_t kLightingProbes = 1u, kLightingHalfLights = 2u, kLightingResolve = 4u, kLightingAll = 7u;
+    void RecordLighting(VkCommandBuffer cmd, const ViewSetup& view, uint32_t stages = kLightingAll);
     void RecordLuminance(VkCommandBuffer cmd);
     void RecordForward(VkCommandBuffer cmd, const ViewSetup& view, RenderTarget& output);
     void RecordPost(VkCommandBuffer cmd, const SceneLighting& lighting, float dt);
@@ -402,6 +408,7 @@ private:
     Renderer* renderer_ = nullptr;
     TextureManager* textures_ = nullptr;
     VkQueryPool queries_ = VK_NULL_HANDLE;
+    uint32_t* stamps_written_ = nullptr;
     glm::vec3 last_eye_{0.0f};
     DominantLightState dominant_;
     float pending_time_ = 0.0f;
@@ -619,6 +626,7 @@ private:
     std::vector<Draw> draws_;
     std::vector<const Draw*> gbuffer_safe_;  // RecordGBuffer scratch: draws that cannot discard, sorted nearest first
     std::vector<const Draw*> gbuffer_rest_;
+    std::vector<std::pair<float, const Draw*>> gbuffer_order_;  // the sort keys of gbuffer_safe_ (distance to the eye minus radius)
     std::vector<ShadowView> shadow_views_;
     std::vector<uint32_t> probe_order_;
     std::vector<const SceneLight*> light_sources_;

@@ -122,10 +122,13 @@ bool EvaluateLight(Light l, View v, Surface s, bool shadows, vec2 frag, out vec3
     const vec3 dither_frag = vec3(frag, v.exposure.w);
     diffuse = vec3(0.0);
     specular = vec3(0.0);
+    // area lights: no early return for pixels outside the box (it lost the GPU device on the Switch 2, see light_half_main.glsl); they get
+    // no radiance, and the radiance test below drops the light
+    float area_inside = 1.0;
     if (l.info.z != 0) {
         vec3 q = (LT_AREA(l) * vec4(s.world, 1.0)).xyz;
         if (1.0 - max(abs(q.z), max(abs(q.x), abs(q.y))) < 0.0) {
-            return false;
+            area_inside = 0.0;
         }
     }
     bool spot = l.position.w > 0.5;
@@ -136,7 +139,7 @@ bool EvaluateLight(Light l, View v, Surface s, bool shadows, vec2 frag, out vec3
     float d = spot ? max(l.range.y, dist + l.range.x) : max(l.range.y, dist) + l.range.x;
     float d2 = d * d;
     float att = max(0.0, 1.0 / d2 - d2 * l.range.z);
-    vec3 radiance = l.color.rgb * att * v.exposure.x;
+    vec3 radiance = l.color.rgb * att * v.exposure.x * area_inside;
     float shadow_cone = 1.0;
     if (spot) {
         vec3 axis = mat3(v.view) * l.direction.xyz;

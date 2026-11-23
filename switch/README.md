@@ -165,6 +165,25 @@ Requirements: devkitPro with `switch-dev` (devkitA64, libnx) and the portlibs `s
    0.1 ms a frame of the earlier glslang 12 binaries, with the same image. A different compiler version gives different SPIR-V (one
    light shader measured 2% apart between versions), so compare on the console when changing it.
 
+### Switch 2 (ounce-devkit)
+
+With `ounce-devkit` installed in devkitPro (libounce, ouncevk), plus the same `switch-harfbuzz`, `switch-freetype`, `switch-libpng`,
+`switch-bzip2` portlibs, nxvk is not needed: ouncevk (NVK for Switch 2) comes with the devkit.
+```
+cmake -G Ninja -S switch -B build/switch2 -DCMAKE_TOOLCHAIN_FILE=$PWD/cmake/switch2.cmake -DCMAKE_BUILD_TYPE=Release
+ninja -C build/switch2
+```
+`cmake/switch2.cmake` wraps libounce's toolchain (Cortex-A78C flags, `__SWITCH2__`). ouncevk's `libouncevk.a` defines every `vk*`
+entry point, the same names volk defines as function pointers, so the build links a copy with those symbols local to the driver and
+its `vkGetInstanceProcAddr` exported as `vk_icdGetInstanceProcAddr`, the entry point the code already takes from nxvk.
+
+On the Switch 2 the screen is 1920x1080 handheld and, docked, the system's output resolution (`appletGetDefaultDisplayResolution`, which
+follows the TV and the console's TV resolution setting; 1080p if it cannot be read). Docking or undocking while playing rebuilds the
+swapchain at the new size. The scene starts at the screen's size (sizes up to 3840x2160) and dynamic resolution steps it down only when a
+frame misses the budget; the 30 fps lock is off by default (60 fps; a `switch.ini` saved with `lock30=1` keeps the lock). The GPU timer is
+measured against the CPU clock at start-up instead of the Tegra X1 correction. The clock control and performance numbers above are the
+Switch 1's.
+
 ## Known gaps
 
 * Played through to the ending on a Switch Lite (handheld); docked play and other console models are not verified yet. nxvk itself calls its output a "broken Vulkan

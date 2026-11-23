@@ -1,4 +1,5 @@
 #include "engine/render/render_util.h"
+#include "engine/core/trail.h"
 
 #include <cstddef>
 #include <cstdlib>
@@ -119,6 +120,7 @@ void UseTargets(VkCommandBuffer cmd, std::initializer_list<TargetUse> uses) {
 }
 
 void BeginLabel(VkCommandBuffer cmd, const char* name) {
+    TrailF("pass: %s", name);
     if (g_checkpoints && vkCmdSetCheckpointNV) {
         vkCmdSetCheckpointNV(cmd, name);
     }

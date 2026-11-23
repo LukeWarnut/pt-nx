@@ -10,10 +10,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -48,6 +50,57 @@ WindowImpl g_window;
 void SetError(const char* text) { g_error = text; }
 
 void PushEvent(const SDL_Event& event) { g_events.push_back(event); }
+
+// The screen size for an operation mode. Switch: handheld 720p, docked 1080p. Switch 2: handheld 1080p (its screen), docked the system's
+// output resolution, which follows the TV and the console's TV resolution setting (1080p if it cannot be read).
+void ScreenSize(bool docked, int* w, int* h) {
+#ifdef __SWITCH2__
+    *w = 1920;
+    *h = 1080;
+    s32 dw = 0;
+    s32 dh = 0;
+    const Result rc = appletGetDefaultDisplayResolution(&dw, &dh);
+    pt::LogInfo("switch: system display resolution {}x{} ({:#x})", dw, dh, static_cast<unsigned>(rc));
+    if (docked && R_SUCCEEDED(rc) && dw >= 640 && dh >= 360 && dw <= 7680 && dh <= 4320) {
+        *w = dw;
+        *h = dh;
+    }
+#else
+    *w = docked ? 1920 : 1280;
+    *h = docked ? 1080 : 720;
+#endif
+}
+
+#ifdef __SWITCH2__
+// Docking and undocking while running: the operation mode and the system's display resolution are checked on every event pump; a new screen
+// size becomes the window size and an SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, and the renderer rebuilds its swapchain at that size
+// (vk_context.cpp resizes the NWindow through pt_switch_window_apply_size between the old swapchain and the new one)
+bool g_docked = false;
+Event g_resolution_event{};
+bool g_resolution_event_ok = false;
+
+void CheckScreenSize() {
+    const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
+    bool changed = docked != g_docked;
+    if (g_resolution_event_ok && R_SUCCEEDED(eventWait(&g_resolution_event, 0))) changed = true;
+    if (!changed) return;
+    g_docked = docked;
+    int w = 0;
+    int h = 0;
+    ScreenSize(docked, &w, &h);
+    if (w == g_window.w && h == g_window.h) return;
+    pt::LogInfo("switch: {}, screen {}x{} -> {}x{}", docked ? "docked" : "handheld", g_window.w, g_window.h, w, h);
+    g_window.w = w;
+    g_window.h = h;
+    g_window.mode.w = w;
+    g_window.mode.h = h;
+    SDL_Event resize{};
+    resize.type = SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
+    resize.window.data1 = w;
+    resize.window.data2 = h;
+    PushEvent(resize);
+}
+#endif
 
 void EnsurePad() {
     if (g_pad_ready) return;
@@ -244,7 +297,16 @@ const char* SDL_GetError(void) { return g_error.c_str(); }
 int SDL_GetVersion(void) { return SDL_VERSIONNUM(3, 4, 16); }
 bool SDL_SetHint(const char*, const char*) { return true; }
 
-bool SDL_Init(SDL_InitFlags flags) { return SDL_InitSubSystem(flags); }
+extern "C" void pt_switch_install_crash_hooks();
+
+bool SDL_Init(SDL_InitFlags flags) {
+    static bool hooks = false;
+    if (!hooks) {
+        hooks = true;
+        pt_switch_install_crash_hooks();
+    }
+    return SDL_InitSubSystem(flags);
+}
 
 bool SDL_InitSubSystem(SDL_InitFlags flags) {
     if ((flags & SDL_INIT_AUDIO) && !(g_init & SDL_INIT_AUDIO)) {
@@ -296,11 +358,14 @@ SDL_Window* SDL_CreateWindow(const char*, int, int, SDL_WindowFlags) {
     pt::LogInfo("switch: nwindowGetDefault");
     NWindow* native = nwindowGetDefault();
     pt::LogInfo("switch: window {}", static_cast<const void*>(native));
-    // handheld renders 720p, docked 1080p
     const bool docked = appletGetOperationMode() == AppletOperationMode_Console;
     pt::LogInfo("switch: {}", docked ? "docked" : "handheld");
-    g_window.w = docked ? 1920 : 1280;
-    g_window.h = docked ? 1080 : 720;
+    ScreenSize(docked, &g_window.w, &g_window.h);
+#ifdef __SWITCH2__
+    g_docked = docked;
+    g_resolution_event_ok = R_SUCCEEDED(appletGetDefaultDisplayResolutionChangeEvent(&g_resolution_event));
+    if (g_resolution_event_ok) eventClear(&g_resolution_event);
+#endif
     nwindowSetDimensions(native, static_cast<u32>(g_window.w), static_cast<u32>(g_window.h));
     g_window.mode = {1, 0, g_window.w, g_window.h, 1.0f, 60.0f};
     return &window;
@@ -519,6 +584,23 @@ bool SDL_PollEvent(SDL_Event* event) {
             PushEvent(quit);
         }
         PumpPad();
+#ifdef __SWITCH2__
+        CheckScreenSize();
+        // Switch 2 bring-up: holding L + R + ZL + ZR + D-pad down for about 2 s crashes on purpose (a write to address 8), to see whether the
+        // CPU exception handler below runs under the HEN (crash.txt) or the title is closed without it
+        if (g_pad_ready) {
+            static int held = 0;
+            constexpr u64 kCombo = HidNpadButton_L | HidNpadButton_R | HidNpadButton_ZL | HidNpadButton_ZR | HidNpadButton_Down;
+            if ((padGetButtons(&g_pad) & kCombo) == kCombo) {
+                if (++held == 120) {
+                    pt::LogError("switch 2 check: deliberate crash (L + R + ZL + ZR + down held)");
+                    *reinterpret_cast<volatile u64*>(static_cast<uintptr_t>(8)) = 1;
+                }
+            } else {
+                held = 0;
+            }
+        }
+#endif
     }
     if (g_events.empty()) return false;
     if (event) *event = g_events.front();
@@ -924,7 +1006,113 @@ extern "C" void pt_switch_log_gpu_rates() {
 // Only called when the user asks for it (clocks.ini, nxlink arguments): the system otherwise picks the clock.
 // 30 fps lock: the number of VBlanks each queued image stays on screen. nxvk's WSI resets the window to 1 whenever it creates a
 // swapchain, so the renderer applies this before every present (it only stores NWindow::swap_interval, which nwindowQueueBuffer sends)
+// CPU exceptions (a crash on the CPU side): libnx runs __libnx_exception_handler on its own stack when one is provided. It writes the kind,
+// the registers and a frame-pointer backtrace to sdmc:/switch/pt/save/crash.txt and the log, with addresses as offsets into pt.elf (the .nro's
+// code starts at the module base), for aarch64-none-elf-addr2line -e pt.elf. Returning ends the process (svcBreak in libnx).
+alignas(16) u8 __nx_exception_stack[0x8000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+
+namespace {
+void WriteCrashText(const char* text) {
+    if (FILE* f = std::fopen("sdmc:/switch/pt/save/crash.txt", "w")) {
+        std::fputs(text, f);
+        std::fclose(f);
+    }
+    pt::LogError("{}", text);
+}
+
+// abort() (newlib raises SIGABRT, then exits) and std::terminate (an uncaught C++ exception) end the process without a CPU exception
+void OnAbortSignal(int) {
+    WriteCrashText("crash: abort() (SIGABRT)\n");
+    std::signal(SIGABRT, SIG_DFL);
+}
+
+void OnTerminate() {
+    char text[512];
+    std::snprintf(text, sizeof(text), "crash: std::terminate (no active exception)\n");
+    if (std::exception_ptr current = std::current_exception()) {
+        try {
+            std::rethrow_exception(current);
+        } catch (const std::exception& e) {
+            std::snprintf(text, sizeof(text), "crash: std::terminate, uncaught exception: %s\n", e.what());
+        } catch (...) {
+            std::snprintf(text, sizeof(text), "crash: std::terminate, uncaught exception of an unknown type\n");
+        }
+    }
+    WriteCrashText(text);
+    std::abort();
+}
+}  // namespace
+
+extern "C" void pt_switch_install_crash_hooks() {
+    std::signal(SIGABRT, OnAbortSignal);
+    std::set_terminate(OnTerminate);
+}
+
+namespace {
+u64 ModuleBase() {
+    MemoryInfo info{};
+    u32 page = 0;
+    if (R_FAILED(svcQueryMemory(&info, &page, reinterpret_cast<u64>(&ModuleBase)))) return 0;
+    return info.addr;
+}
+
+bool Readable(u64 address) {
+    if (address == 0 || (address & 7) != 0) return false;
+    MemoryInfo info{};
+    u32 page = 0;
+    if (R_FAILED(svcQueryMemory(&info, &page, address))) return false;
+    return (info.perm & Perm_R) != 0 && address + 16 <= info.addr + info.size;
+}
+
+const char* ExceptionName(u32 desc) {
+    switch (desc) {
+        case ThreadExceptionDesc_InstructionAbort: return "instruction abort";
+        case ThreadExceptionDesc_MisalignedPC: return "misaligned PC";
+        case ThreadExceptionDesc_MisalignedSP: return "misaligned SP";
+        case ThreadExceptionDesc_SError: return "SError";
+        case ThreadExceptionDesc_BadSVC: return "bad SVC";
+        case ThreadExceptionDesc_Trap: return "trap";
+        case ThreadExceptionDesc_Other: return "data abort or other";
+        default: return "unknown";
+    }
+}
+}  // namespace
+
+extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
+    const u64 base = ModuleBase();
+    char text[2048];
+    int n = std::snprintf(text, sizeof(text),
+                          "crash: CPU exception %s (0x%x), esr 0x%x, far 0x%lx\n"
+                          "crash: pc 0x%lx (pt.elf+0x%lx), lr 0x%lx (pt.elf+0x%lx), sp 0x%lx, module base 0x%lx\n"
+                          "crash: backtrace (pt.elf offsets):",
+                          ExceptionName(ctx->error_desc), ctx->error_desc, ctx->esr, ctx->far.x, ctx->pc.x, ctx->pc.x - base, ctx->lr.x,
+                          ctx->lr.x - base, ctx->sp.x, base);
+    u64 fp = ctx->fp.x;
+    for (int depth = 0; depth < 24 && Readable(fp) && n > 0 && n < static_cast<int>(sizeof(text)) - 24; ++depth) {
+        const u64* frame = reinterpret_cast<const u64*>(fp);
+        const u64 ret = frame[1];
+        if (ret < base) break;
+        n += std::snprintf(text + n, sizeof(text) - static_cast<size_t>(n), " 0x%lx", ret - base);
+        if (frame[0] <= fp) break;
+        fp = frame[0];
+    }
+    if (n > 0 && n < static_cast<int>(sizeof(text)) - 1) {
+        text[n++] = '\n';
+        text[n] = '\0';
+    }
+    WriteCrashText(text);
+}
+
 extern "C" void pt_switch_set_swap_interval(unsigned interval) { nwindowSetSwapInterval(nwindowGetDefault(), interval); }
+
+#ifdef __SWITCH2__
+// Called by vk_context.cpp before it creates a swapchain, with no swapchain alive (an NWindow's size cannot change while buffers are registered)
+extern "C" void pt_switch_window_apply_size(unsigned width, unsigned height) {
+    const Result rc = nwindowSetDimensions(nwindowGetDefault(), width, height);
+    if (R_FAILED(rc)) pt::LogInfo("switch: window size {}x{} not set ({:#x})", width, height, static_cast<unsigned>(rc));
+}
+#endif
 
 extern "C" unsigned pt_switch_set_gpu_mhz(unsigned mhz) {
     if (!EnsureClocks()) return 0;

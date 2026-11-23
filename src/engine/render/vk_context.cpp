@@ -4,9 +4,11 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 
 #include "engine/core/crash_report.h"
 #include "engine/core/log.h"
@@ -191,7 +193,7 @@ bool Context::Init(SDL_Window* window, bool validation) {
         LogInfo("vulkan: subgroups of {}, stages 0x{:X}, operations 0x{:X}", subgroup.subgroupSize, subgroup.supportedStages,
                 subgroup.supportedOperations);
     }
-#ifdef PT_SWITCH
+#if defined(PT_SWITCH) && !defined(__SWITCH2__)
     // The Tegra X1's GPU timer counts from the 19.2 MHz crystal where desktop Maxwell has 31.25 MHz, but NVK reports the desktop period:
     // raw timestamp deltas are 19.2/31.25 of real time (measured: frame interval / GPU span = 1.628-1.633 at 960x540 to 1280x720)
     properties.limits.timestampPeriod *= 31.25f / 19.2f;
@@ -354,6 +356,9 @@ bool Context::Init(SDL_Window* window, bool validation) {
     if (!Check(vkCreateCommandPool(device, &pool_info, nullptr, &upload_pool_), "vkCreateCommandPool")) {
         return false;
     }
+#ifdef __SWITCH2__
+    CalibrateTimestampPeriod();
+#endif
     if (hooks) {
         hooks->DeviceCreated(*this);
     }
@@ -389,8 +394,66 @@ void Context::Shutdown() {
     instance = VK_NULL_HANDLE;
 }
 
+#ifdef __SWITCH2__
+extern "C" void pt_switch_window_apply_size(unsigned width, unsigned height);
+
+// The Switch 2's GPU timer rate is not the Tegra X1's, and the driver's timestampPeriod may not match it either: two timestamps 50 ms apart
+// on the CPU clock give the real period (submission latency is well under 1% of the interval). The renderer's GPU times (dynamic resolution,
+// the automatic clock, the overlay) read properties.limits.timestampPeriod.
+void Context::CalibrateTimestampPeriod() {
+    const float reported = properties.limits.timestampPeriod;
+    VkQueryPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = 2;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+        return;
+    }
+    using clock = std::chrono::steady_clock;
+    const auto stamp = [&](uint32_t query) {
+        const auto before = clock::now();
+        Submit([&](VkCommandBuffer cmd) {
+            if (query == 0) {
+                vkCmdResetQueryPool(cmd, pool, 0, 2);
+            }
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, pool, query);
+        }, "timestamp calibration");
+        const auto after = clock::now();
+        return before + (after - before) / 2;
+    };
+    const auto t0 = stamp(0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto t1 = stamp(1);
+    uint64_t ticks[2] = {};
+    const VkResult result = vkGetQueryPoolResults(device, pool, 0, 2, sizeof(ticks), ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    vkDestroyQueryPool(device, pool, nullptr);
+    const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
+    if (result != VK_SUCCESS || ticks[1] <= ticks[0]) {
+        LogInfo("vulkan: timestamp calibration failed, the driver's period {:.4f} ns is used", reported);
+        return;
+    }
+    const double measured = ns / static_cast<double>(ticks[1] - ticks[0]);
+    if (measured < 0.05 || measured > 1000.0) {
+        LogInfo("vulkan: timestamp calibration gave {:.4f} ns, the driver's period {:.4f} ns is used", measured, reported);
+        return;
+    }
+    properties.limits.timestampPeriod = static_cast<float>(measured);
+    LogInfo("vulkan: timestamp period measured {:.4f} ns (the driver reports {:.4f} ns)", measured, reported);
+}
+#endif
+
 bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
     vkDeviceWaitIdle(device);
+#ifdef __SWITCH2__
+    // A new screen size (docked or undocked while running): the NWindow's size can change only while no buffers are registered with it, so
+    // the old swapchain goes first, then the window takes the size, then the new swapchain is made (from no old one)
+    if (swapchain.handle && (swapchain.extent.width != width || swapchain.extent.height != height)) {
+        DestroySwapchain();
+    }
+    if (!swapchain.handle) {
+        pt_switch_window_apply_size(width, height);
+    }
+#endif
     vsync = vsync && !force_vsync_off;
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps);
@@ -419,6 +482,9 @@ bool Context::CreateSwapchain(uint32_t width, uint32_t height, bool vsync) {
             present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : present_mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : "fifo",
             vsync ? "on" : "off");
     VkExtent2D extent = caps.currentExtent;
+#ifdef __SWITCH2__
+    LogInfo("vulkan: swapchain for {}x{} (surface current extent {}x{})", width, height, caps.currentExtent.width, caps.currentExtent.height);
+#endif
     if (extent.width == 0xFFFFFFFFu) {
         extent.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
         extent.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
@@ -636,7 +702,7 @@ void Context::DestroyBuffer(Buffer& buffer) {
     buffer = Buffer{};
 }
 
-void Context::Submit(const std::function<void(VkCommandBuffer)>& record) {
+void Context::Submit(const std::function<void(VkCommandBuffer)>& record, const char* label) {
     VkCommandBufferAllocateInfo alloc{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     alloc.commandPool = upload_pool_;
     alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -656,8 +722,17 @@ void Context::Submit(const std::function<void(VkCommandBuffer)>& record) {
     VkFenceCreateInfo fence_info{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence fence;
     vkCreateFence(device, &fence_info, nullptr, &fence);
-    CheckDeviceLost(vkQueueSubmit2(queue, 1, &submit, fence), "one-time submit");
-    CheckDeviceLost(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "one-time submit wait");
+    const std::string what = label ? std::string(label) : std::string("one-time submit");
+    CheckDeviceLost(vkQueueSubmit2(queue, 1, &submit, fence), what.c_str());
+#ifdef __SWITCH2__
+    VkResult wait = VK_TIMEOUT;
+    for (int step = 1; (wait = vkWaitForFences(device, 1, &fence, VK_TRUE, 250'000'000ull)) == VK_TIMEOUT; ++step) {
+        LogError("gpu: {} not finished after {} ms", what, step * 250);
+    }
+    CheckDeviceLost(wait, (what + " wait").c_str());
+#else
+    CheckDeviceLost(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), (what + " wait").c_str());
+#endif
     vkDestroyFence(device, fence, nullptr);
     vkFreeCommandBuffers(device, upload_pool_, 1, &cmd);
 }

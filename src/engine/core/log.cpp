@@ -52,9 +52,10 @@ void LogWrite(LogLevel level, std::string_view text) {
     std::fprintf(stderr, "[%9.3f] %-5s %s%.*s\n", seconds, LevelTag(level), tick, static_cast<int>(text.size()), text.data());
     if (g_log_file) {
         std::fprintf(g_log_file, "[%9.3f] %-5s %s%.*s\n", seconds, LevelTag(level), tick, static_cast<int>(text.size()), text.data());
-#ifdef PT_SWITCH
+#if defined(PT_SWITCH) && !defined(__SWITCH2__)
         // A flush per line is a write to the SD card: the status block (several lines every 10 s) stalled the frame loop. Information lines
-        // are flushed once a second; warnings and errors at once, so the last lines before a crash are on the card.
+        // are flushed once a second; warnings and errors at once, so the last lines before a crash are on the card. (The Switch 2 build,
+        // still being brought up, flushes every line: a crash that bypasses the handlers then still leaves its last lines on the card.)
         static double last_flush = 0.0;
         if (level == LogLevel::Warn || level == LogLevel::Error || seconds - last_flush >= 1.0) {
             std::fflush(g_log_file);

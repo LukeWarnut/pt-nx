@@ -1,4 +1,5 @@
 #include "engine/render/texture_manager.h"
+#include "engine/core/trail.h"
 
 #include <cstdlib>
 #include <stb_image.h>
@@ -449,6 +450,7 @@ void TextureManager::DecodeAhead(const QarArchive& qar, const std::vector<std::s
     }
     decode_workers_.push_back(std::async(std::launch::async, [&qar, jobs = std::move(jobs)]() mutable {
         for (auto& [stem, promise] : jobs) {
+            TrailF("texture decode: %.80s", stem.c_str());
             auto ftex = std::make_shared<FtexTexture>();
             if (!LoadFtex(qar, stem, *ftex)) {
                 ftex.reset();

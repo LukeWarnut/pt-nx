@@ -64,6 +64,15 @@ void SoundSystem::Shutdown() {
 }
 
 PlayingId SoundSystem::PostEvent(std::string_view event_name, GameObjectId object) {
+    // test: PT_MUTE_EVENTS=<name>,<name>,... posts none of these events, whatever system posts them (demos, gimmicks, effects)
+    static const std::string muted = [] {
+        const char* v = std::getenv("PT_MUTE_EVENTS");
+        return v ? "," + std::string(v) + "," : std::string();
+    }();
+    if (!muted.empty() && muted.find("," + std::string(event_name) + ",") != std::string::npos) {
+        LogInfo("audio: event {} muted (PT_MUTE_EVENTS)", event_name);
+        return 0;
+    }
     const uint32_t id = Fnv1Hash32(event_name);
     const PlayingId playing = PostEventId(id, object);
     if (!playing && engine_) {

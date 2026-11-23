@@ -39,6 +39,7 @@
 #include "engine/assets/fmdl.h"
 #include "engine/assets/enhanced_textures.h"
 #include "engine/assets/geom.h"
+#include "engine/core/trail.h"
 #include "engine/core/log.h"
 #include "engine/core/crash_report.h"
 #include "engine/core/memory_status.h"
@@ -139,15 +140,42 @@ void BoostMemoryForAutoClock() {
 }
 
 // Switch graphics options: the ImGui menu (Minus) edits them, the adaptive load logic in RunGame follows them, switch.ini keeps them
+#ifdef __SWITCH2__
+// Switch 2: the screen is 1080p handheld and up to 4K docked (the TV's resolution), and the scene can render at the screen's size: the larger
+// sizes come first, and SwitchTopLevel() leaves out the ones larger than the screen
+constexpr VkExtent2D kSwitchSizes[] = {{3840, 2160}, {3200, 1800}, {2560, 1440}, {2240, 1260}, {1920, 1080}, {1600, 900}, {1440, 810},
+                                      {1280, 720},  {1152, 648},  {1088, 612},  {1024, 576},  {960, 540},   {896, 504},  {864, 486},
+                                      {832, 468},   {800, 450},   {768, 432},   {736, 414},   {704, 396},   {640, 360},  {608, 342},
+                                      {576, 324},   {512, 288},   {448, 252}};
+constexpr int kSwitchStartLevel = 0;         // the screen's size (clamped to SwitchTopLevel); dynamic resolution steps down if a frame misses
+constexpr bool kSwitchLock30Default = false;  // 60 fps
+#else
 constexpr VkExtent2D kSwitchSizes[] = {{1280, 720}, {1152, 648}, {1088, 612}, {1024, 576}, {960, 540}, {896, 504},
                                       {864, 486},  {832, 468},  {800, 450},  {768, 432},  {736, 414}, {704, 396},
                                       {640, 360},  {608, 342},  {576, 324},  {512, 288},  {448, 252}};
+constexpr int kSwitchStartLevel = 4;  // 960x540
+constexpr bool kSwitchLock30Default = true;
+#endif
 constexpr int kSwitchLevels = static_cast<int>(sizeof(kSwitchSizes) / sizeof(kSwitchSizes[0]));
+// the largest scene size the screen holds (Switch 2: it changes with docking); on the Switch the list starts at the handheld screen's size
+int SwitchTopLevel() {
+#ifdef __SWITCH2__
+    int w = 0;
+    int h = 0;
+    SDL_GetWindowSizeInPixels(nullptr, &w, &h);
+    for (int i = 0; i < kSwitchLevels; ++i) {
+        if (static_cast<int>(kSwitchSizes[i].width) <= w && static_cast<int>(kSwitchSizes[i].height) <= h) return i;
+    }
+    return kSwitchLevels - 1;
+#else
+    return 0;
+#endif
+}
 struct SwitchGfx {
     bool dynamic = true;       // dynamic resolution: the scene render size follows the measured GPU time
     bool overlay = false;      // fps, scene size and GPU time in the corner of the screen
-    bool lock30 = true;        // every image stays on screen 2 VBlanks: a steady 30 fps (swap interval 2)
-    int level = 4;             // index into kSwitchSizes: the current size (the start size and the manual size), 4 = 960x540
+    bool lock30 = kSwitchLock30Default;  // every image stays on screen 2 VBlanks: a steady 30 fps (swap interval 2); off: 60 fps
+    int level = kSwitchStartLevel;  // index into kSwitchSizes: the current size (the start size and the manual size)
     bool frame_gen = false;    // LSFG frame generation (30 -> 60): needs the user's Lossless.dll on the SD card
     float lsfg_flow = 2.0f;    // its motion flow factor: higher is cheaper and coarser
     bool fidelity = false;     // the fidelity preset (Minus menu): the PS4 settings and full-size everything, far slower
@@ -1311,8 +1339,8 @@ void ApplyFidelity(App& app, bool on) {
     app.renderer.sharpen = on ? 0.0f : -1.0f;
     pt::SetMaxTextureSide(on ? 0u : 1024u);
     g_switch_gfx.dynamic = !on;
-    g_switch_gfx.lock30 = !on;
-    g_switch_gfx.level = on ? 0 : 4;
+    g_switch_gfx.lock30 = on ? false : kSwitchLock30Default;
+    g_switch_gfx.level = on ? SwitchTopLevel() : kSwitchStartLevel;
     pt::ApplyGraphicsPreset(app.settings, on ? pt::GraphicsPreset::Original : pt::GraphicsPreset::Low, false);
     ApplyGraphicsSettings(app);
     if (!app.settings_path.empty()) pt::SaveAppSettings(app.settings_path, app.settings);
@@ -1361,9 +1389,13 @@ void DrawSwitchSection(App& app) {
     char current[48];
     std::snprintf(current, sizeof(current), "%ux%u", kSwitchSizes[g_switch_gfx.level].width, kSwitchSizes[g_switch_gfx.level].height);
     if (ImGui::BeginCombo(g_switch_gfx.dynamic ? "Start size" : "Scene render size", current)) {
-        for (int i = 0; i < kSwitchLevels; ++i) {
+        for (int i = SwitchTopLevel(); i < kSwitchLevels; ++i) {
             char label[48];
+#ifdef __SWITCH2__
+            std::snprintf(label, sizeof(label), "%ux%u%s", kSwitchSizes[i].width, kSwitchSizes[i].height, i == SwitchTopLevel() ? "  (screen)" : "");
+#else
             std::snprintf(label, sizeof(label), "%ux%u%s", kSwitchSizes[i].width, kSwitchSizes[i].height, i == 0 ? "  (screen, handheld)" : "");
+#endif
             if (ImGui::Selectable(label, i == g_switch_gfx.level)) g_switch_gfx.level = i;
         }
         ImGui::EndCombo();
@@ -3801,6 +3833,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
     bool was_focused = true;
     float applied_volume = -1.0f;
     while (running) {
+        pt::TrailF("main: frame %llu, events", static_cast<unsigned long long>(frame));
         bool visible = PumpEvents(app, &input, running) || vr != nullptr;
         if (vr) {
             vr->BeginLoop(running);
@@ -4133,7 +4166,9 @@ int RunGame(App& app, pt::Vfs& vfs) {
                 if (state.pause || state.cancel || (state.confirm && !model)) theater->theater->Stop();
                 theater->theater->Update(step, state);
             } else {
+                pt::Trail("main: game update");
                 game.Update(step, state);
+                pt::Trail("main: game update done");
             }
             const auto tick_t1 = std::chrono::steady_clock::now();
             if (theater) {
@@ -4552,10 +4587,12 @@ int RunGame(App& app, pt::Vfs& vfs) {
             static const char* parts_csv = std::getenv("PT_PARTS_CSV");
             using parts_ms = std::chrono::duration<float, std::milli>;
             const auto part_t0 = std::chrono::steady_clock::now();
+            pt::Trail("main: begin frame (fence wait, acquire)");
             if (!app.renderer.BeginFrame()) {
                 continue;
             }
             const auto part_t1 = std::chrono::steady_clock::now();
+            pt::Trail("main: view build");
             view_builder.log_lens_next = !shots.empty();
             view_builder.Build(view, camera, theater ? static_cast<float>(dt) : static_cast<float>(game.Time() - last_scene_time), lighting,
                                light_blend);
@@ -4564,6 +4601,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
                 ApplyPhotoLens(photo_panel.Settings(), game, camera, lighting);
             }
             const auto part_t2 = std::chrono::steady_clock::now();
+            pt::Trail("main: vfx prepare");
             const VkExtent2D vfx_extent = app.renderer.RenderExtent();
             view_vfx.Prepare(view, camera, static_cast<float>(vfx_extent.width) / static_cast<float>(std::max(1u, vfx_extent.height)), lighting,
                              vfx_pass, blend);
@@ -4604,11 +4642,15 @@ int RunGame(App& app, pt::Vfs& vfs) {
                 app.scene.RequestTargetDump();
             }
             const auto part_t4 = std::chrono::steady_clock::now();
+            pt::Trail("main: scene render (record)");
             app.scene.Render(camera, draw_items, lighting, dt);
+            pt::Trail("main: reflection readback");
             take_reflection_readback(view);
             last_render_frame = frame;
             const auto part_t5 = std::chrono::steady_clock::now();
+            pt::Trail("main: end frame (UI, submit, present)");
             app.renderer.EndFrame(app.window != nullptr);
+            pt::Trail("main: end frame done");
             if (parts_csv) {
                 parts_row[3] = parts_ms(part_t5 - part_t4).count();
                 parts_last_end = std::chrono::steady_clock::now();
@@ -5125,7 +5167,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
                     g_switch_gfx.dynamic = false;
                     g_switch_gfx.level = levels[current];
                 }
-                g_switch_gfx.level = std::clamp(g_switch_gfx.level, 0, kSwitchLevels - 1);
+                g_switch_gfx.level = std::clamp(g_switch_gfx.level, SwitchTopLevel(), kSwitchLevels - 1);
                 if (!pinned && applied_level != g_switch_gfx.level) {
                     app.renderer.SetRenderExtent(kSwitchSizes[g_switch_gfx.level]);
                     pt::LogInfo("switch: scene render size {}x{}", kSwitchSizes[g_switch_gfx.level].width, kSwitchSizes[g_switch_gfx.level].height);
@@ -5267,7 +5309,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
                             return v ? std::clamp(std::strtod(v, nullptr), 0.5, 0.96) : 0.0;
                         }();
                         const double up_margin = up_margin_env > 0.0 ? up_margin_env : (g_switch_gfx.lock30 ? 0.90 : 0.85);
-                        if (level > 0 && now_s >= blocked_until[level - 1] && predict(p90, level, level - 1) < budget * up_margin) {
+                        if (level > SwitchTopLevel() && now_s >= blocked_until[level - 1] && predict(p90, level, level - 1) < budget * up_margin) {
                             target = level - 1;
                         } else if (g_clock_config.automatic && rate_count > 0 && p90 < budget * 0.46 && clock_index > base_index) {
                             clock_target = clock_index - 1;
@@ -6138,6 +6180,10 @@ int main(int argc, char** argv) {
         // the Tegra X1 cannot shade the scene at 720p/1080p at a playable rate: the scene is rendered smaller and scaled to the screen by the final pass
         {
             const bool pinned = g_clock_config.pinned_w > 0 && g_clock_config.pinned_h > 0;
+            g_switch_gfx.level = std::clamp(g_switch_gfx.level, SwitchTopLevel(), kSwitchLevels - 1);
+#ifdef __SWITCH2__
+            app.renderer.on_late_frame = [&app](uint32_t frame_index) { app.scene.LogGpuProgress(frame_index); };
+#endif
             const uint32_t w = pinned ? g_clock_config.pinned_w : kSwitchSizes[g_switch_gfx.level].width;
             const uint32_t h = pinned ? g_clock_config.pinned_h : kSwitchSizes[g_switch_gfx.level].height;
             app.renderer.SetRenderExtent({w, h});

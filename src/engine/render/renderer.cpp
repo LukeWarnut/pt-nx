@@ -14,6 +14,7 @@
 #include <cstring>
 #include <utility>
 
+#include "engine/core/trail.h"
 #include "engine/core/log.h"
 #include "engine/render/upscale/streamline.h"
 #include "engine/render/pipeline_cache.h"
@@ -372,7 +373,21 @@ bool Renderer::BeginFrame(bool present) {
     late_acquire_ = window_ != nullptr && (late_acquire_env_ || frame_generation);
     streamline::BeginFrame();
     const auto fence_start = std::chrono::steady_clock::now();
+#ifdef __SWITCH2__
+    {
+        // waited in 250 ms steps so that a GPU hang is logged (and placed by on_late_frame) before the system's watchdog closes the program
+        VkResult wait = VK_TIMEOUT;
+        for (int step = 1; (wait = vkWaitForFences(ctx_.device, 1, &frame.in_flight, VK_TRUE, 250'000'000ull)) == VK_TIMEOUT; ++step) {
+            LogError("gpu: frame {} not finished after {} ms", frame_index_, step * 250);
+            if (step == 1 && on_late_frame) {
+                on_late_frame(frame_index_);
+            }
+        }
+        ctx_.CheckDeviceLost(wait, "frame fence wait");
+    }
+#else
     ctx_.CheckDeviceLost(vkWaitForFences(ctx_.device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX), "frame fence wait");
+#endif
     timing_.fence_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - fence_start).count();
     if (frame_queries_ && frame_queries_written_[frame_index_]) {
         uint64_t stamps[2] = {};
@@ -767,7 +782,22 @@ void Renderer::EndFrame(bool draw_ui) {
     if (!late) {
         frame.submit_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
+    pt::Trail("renderer: frame submit");
     ctx_.CheckDeviceLost(vkQueueSubmit2(ctx_.queue, 1, &submit, fg_follow ? VK_NULL_HANDLE : frame.in_flight), "frame submit");
+#ifdef __SWITCH2__
+    // Switch 2 bring-up (PT_SYNC_GPU=1): the CPU waits for each frame's GPU work right after submitting it, so the trail shows whether the
+    // program died while the GPU was working on a frame
+    static const bool sync_gpu = std::getenv("PT_SYNC_GPU") && std::atoi(std::getenv("PT_SYNC_GPU")) != 0;
+    if (sync_gpu && !fg_follow) {
+        pt::TrailF("renderer: waiting for the GPU (frame slot %u, sync)", frame_index_);
+        VkResult wait = VK_TIMEOUT;
+        while ((wait = vkWaitForFences(ctx_.device, 1, &frame.in_flight, VK_TRUE, 250'000'000ull)) == VK_TIMEOUT) {
+            LogError("gpu: frame slot {} not finished (sync)", frame_index_);
+        }
+        ctx_.CheckDeviceLost(wait, "frame fence wait (sync)");
+        pt::Trail("renderer: GPU done (sync)");
+    }
+#endif
     streamline::SetMarker(streamline::Marker::RenderSubmitEnd);
     if (presenting_) {
         VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -784,7 +814,9 @@ void Renderer::EndFrame(bool draw_ui) {
         }
 #endif
         const auto present_start = std::chrono::steady_clock::now();
+        pt::Trail("renderer: present");
         const VkResult result = ctx_.QueuePresent(present);
+        pt::Trail("renderer: present done");
         ++presents;
         if (fg_follow) ++generated_presents;
         timing_.present_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - present_start).count();

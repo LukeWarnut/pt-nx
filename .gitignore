@@ -42,3 +42,4 @@ Lossless.dll
 
 # personal Switch build assets (the PS4 title art for the owner's own .nro): never in the repository
 /switch/assets/private/
+.DS_Store

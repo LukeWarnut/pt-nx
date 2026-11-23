@@ -70,7 +70,8 @@ public:
     bool CreateBuffer(Buffer& out, VkDeviceSize size, VkBufferUsageFlags usage, bool host_visible);
     void DestroyBuffer(Buffer& buffer);
 
-    void Submit(const std::function<void(VkCommandBuffer)>& record);
+    // label: named in the log if the device is lost while this submission runs (default "one-time submit")
+    void Submit(const std::function<void(VkCommandBuffer)>& record, const char* label = nullptr);
     bool Upload(Buffer& dst, const void* data, VkDeviceSize size);
 
     VkInstance instance = VK_NULL_HANDLE;
@@ -104,6 +105,9 @@ public:
     bool device_fault = false;
     bool checkpoints = false;
     void CheckDeviceLost(VkResult result, const char* where);
+#ifdef __SWITCH2__
+    void CalibrateTimestampPeriod();
+#endif
 
 private:
     VkCommandPool upload_pool_ = VK_NULL_HANDLE;

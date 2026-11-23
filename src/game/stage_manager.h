@@ -2,6 +2,7 @@
 
 #include <glm/glm.hpp>
 
+#include <chrono>
 #include <functional>
 #include <future>
 #include <map>
@@ -233,6 +234,12 @@ private:
 
     Vfs& vfs_;
     ModelCache& models_;
+#ifdef __SWITCH2__
+    // Switch 2 bring-up: unloaded stages are freed 20 s later (Update), not at once. The title closed 0.5-2 s after the first stage unload,
+    // with mimalloc (libounce's allocator, which returns freed pages to the system) and without a fault the program could catch: a read of the
+    // unloaded stage's memory is the suspect. If the crash goes away, or moves to the delayed free, that is confirmed.
+    std::vector<std::pair<std::chrono::steady_clock::time_point, std::unique_ptr<Stage>>> quarantine_;
+#endif
     std::optional<std::string> pending_location_;
     std::optional<PendingLoad> pending_load_;
     std::optional<std::string> pending_activate_;

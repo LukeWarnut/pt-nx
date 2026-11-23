@@ -1,4 +1,5 @@
 #include "engine/audio/audio_engine.h"
+#include "engine/core/trail.h"
 
 #include <SDL3/SDL.h>
 
@@ -45,7 +46,9 @@ void AudioOutput::Callback(void* user, SDL_AudioStream* stream, int additional, 
         return;
     }
     output->buffer_.resize(static_cast<size_t>(frames) * 2);
+    Trail("audio: mixing");
     output->render_(output->buffer_.data(), frames);
+    Trail("audio: mixed");
     SDL_PutAudioStreamData(stream, output->buffer_.data(), static_cast<int>(output->buffer_.size() * sizeof(float)));
 }
 

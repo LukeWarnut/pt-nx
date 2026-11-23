@@ -4,6 +4,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <format>
 #include <string>
 
+#include "engine/core/trail.h"
 #include "engine/core/log.h"
 #include "engine/fs/vfs.h"
 #include "engine/render/scene_renderer.h"
@@ -1718,9 +1720,31 @@ void SceneRenderer::RecordGBuffer(VkCommandBuffer cmd, const ViewSetup& view) {
                                     d.tint.a <= 1.5f;
         (early_z && gbuffer_early_ && cannot_discard ? gbuffer_safe_ : gbuffer_rest_).push_back(&d);
     }
-    std::sort(gbuffer_safe_.begin(), gbuffer_safe_.end(), [&](const Draw* a, const Draw* b) {
-        return glm::distance(a->center, view.eye) - a->radius < glm::distance(b->center, view.eye) - b->radius;
-    });
+    // Nearest first, on keys computed once. A draw whose bounds are not finite gives a NaN key, and a comparison with NaN is not a strict
+    // weak ordering: std::sort may then walk past the start of the array. On the Switch 2 (mimalloc) that read hit unmapped memory and closed
+    // the title; elsewhere it read neighbouring memory unnoticed. Such draws sort last.
+    Trail("gbuffer: sort");
+    gbuffer_order_.clear();
+    for (const Draw* d : gbuffer_safe_) {
+        float key = glm::distance(d->center, view.eye) - d->radius;
+        if (!std::isfinite(key)) {
+            static uint32_t reported = 0;
+            if (reported < 8) {
+                ++reported;
+                LogError("gbuffer: draw with bounds that are not finite (center {:.3f} {:.3f} {:.3f}, radius {:.3f}, material {}, skin base {}, "
+                         "translation {:.3f} {:.3f} {:.3f}); drawn last",
+                         d->center.x, d->center.y, d->center.z, d->radius, d->material, d->skin_base, d->transform[3].x, d->transform[3].y,
+                         d->transform[3].z);
+            }
+            key = std::numeric_limits<float>::max();
+        }
+        gbuffer_order_.emplace_back(key, d);
+    }
+    std::sort(gbuffer_order_.begin(), gbuffer_order_.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (size_t i = 0; i < gbuffer_order_.size(); ++i) {
+        gbuffer_safe_[i] = gbuffer_order_[i].second;
+    }
+    Trail("gbuffer: early-Z draws");
     if (!gbuffer_safe_.empty()) {
         // One early-Z pipeline per material flag set (constant_id 0/1 of gbuffer_main.glsl: no run-time flag branches, no fetches the material does
         // not use, no tear path). Built on first use, one at a time on a worker thread (PT_GBUFFER_ASYNC=0: in the frame, one per frame); the
@@ -1778,10 +1802,12 @@ void SceneRenderer::RecordGBuffer(VkCommandBuffer cmd, const ViewSetup& view) {
             DrawMesh(cmd, *d, view.index, debug_flags, view.mirrored, false, aux);
         }
     }
+    Trail("gbuffer: other draws");
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, gbuffer_);
     for (const Draw* d : gbuffer_rest_) {
         DrawMesh(cmd, *d, view.index, debug_flags, view.mirrored, false, aux);
     }
+    Trail("gbuffer: decals");
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, decal_);
     vkCmdSetDepthBias(cmd, 1.0f, 0.0f, 1.0f);
     for (const Draw& d : draws_) {
@@ -1886,7 +1912,7 @@ void SceneRenderer::RecordRtAmbientOcclusion(VkCommandBuffer cmd, const ViewSetu
     rt_ao_ready_ = true;
 }
 
-void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
+void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view, uint32_t stages) {
     const VkCullModeFlags cull = view.mirrored ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_FRONT_BIT;
     const bool probes = toggles.probes && probe_count_ > 0;
     const bool lights = toggles.lights && debug_view != DebugView::Ambient;
@@ -1908,7 +1934,8 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
     const uint32_t probe_divisor = quarter_probes ? 4u : (shrink ? 2u : 1u);
     const VkExtent2D acc_area{(area.width + probe_divisor - 1) / probe_divisor, (area.height + probe_divisor - 1) / probe_divisor};
     const VkExtent2D half_area{(area.width + 1) / 2, (area.height + 1) / 2};
-    const bool timed = view.index == main_view_.index;  // timestamps 12-14 split the main view's lighting pass (written every frame)
+    // timestamps 12-14 split the main view's lighting pass (written every frame; not when it is recorded in parts)
+    const bool timed = view.index == main_view_.index && stages == kLightingAll;
     if (timed) {
         Stamp(cmd, 12);
     }
@@ -1977,7 +2004,7 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
             stats_.probes_in_view = as_list ? static_cast<uint32_t>(in_view.size()) : 0u;
         }
     };
-    if (probes) {
+    if (probes && (stages & kLightingProbes) != 0) {
         UseTargets(cmd, {{&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                          {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL},
                          {&probe_acc_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
@@ -2162,7 +2189,7 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
         stats_.light_tile_draws = draws;
         stats_.light_tile_work = static_cast<float>(work / (static_cast<double>(half_area.width) * half_area.height * entries.size()));
     };
-    if (half_lights) {
+    if (half_lights && (stages & kLightingHalfLights) != 0) {
         UseTargets(cmd, {{&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                          {&material_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                          {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL},
@@ -2188,6 +2215,9 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view) {
     }
     if (timed) {
         Stamp(cmd, 14);
+    }
+    if ((stages & kLightingResolve) == 0) {
+        return;
     }
     UseTargets(cmd, {{&albedo_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                      {&normal_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -2814,7 +2844,58 @@ void SceneRenderer::RecordReflectionTemporal(VkCommandBuffer cmd, const ViewSetu
 void SceneRenderer::Stamp(VkCommandBuffer cmd, uint32_t index) {
     if (queries_) {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, queries_, index);
+        if (stamps_written_) {
+            *stamps_written_ |= 1u << index;
+        }
     }
+}
+
+void SceneRenderer::LogGpuProgress(uint32_t frame_index) {
+    if (frame_index >= Renderer::kFramesInFlight) {
+        return;
+    }
+    FrameSlot& slot = slots_[frame_index];
+    if (!slot.queries) {
+        return;
+    }
+    // each timestamp ends the pass before it and starts the one named here, in the order the frame records them
+    static const struct {
+        uint32_t stamp;
+        const char* next;
+    } kOrder[] = {{0, "shadows"},
+                  {1, "mirror view"},
+                  {2, "main view g-buffer"},
+                  {3, "velocity and occlusion"},
+                  {12, "lighting: probes"},
+                  {13, "lighting: half-resolution lights"},
+                  {14, "lighting: resolve"},
+                  {4, "luminance and compose"},
+                  {7, "forward (transparent, effects)"},
+                  {5, "reflection sample and upscale inputs"},
+                  {8, "reflections"},
+                  {9, "upscale"},
+                  {10, "post"},
+                  {11, "post (later part)"},
+                  {6, "the frame after the scene (UI, final pass, present)"}};
+    uint64_t data[kTimestamps * 2] = {};
+    const VkResult result = vkGetQueryPoolResults(device_, slot.queries, 0, kTimestamps, sizeof(data), data, 2 * sizeof(uint64_t),
+                                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    std::string done;
+    const char* in = "the work before the scene (stamp 0 not reached)";
+    const char* stuck = nullptr;
+    for (const auto& entry : kOrder) {
+        if ((slot.stamps_written & (1u << entry.stamp)) == 0) {
+            continue;
+        }
+        if (data[2 * entry.stamp + 1] != 0) {
+            done += std::to_string(entry.stamp) + " ";
+            in = entry.next;
+        } else if (!stuck) {
+            stuck = in;
+        }
+    }
+    LogError("gpu: late frame {}: timestamps reached: {}(written 0x{:x}, query {}); the GPU is in: {}", frame_index, done, slot.stamps_written,
+             static_cast<int>(result), stuck ? stuck : in);
 }
 
 void SceneRenderer::RecordObjectVelocity(VkCommandBuffer cmd, const ViewSetup& view) {
@@ -2977,15 +3058,31 @@ void SceneRenderer::RecordView(VkCommandBuffer cmd, const ViewSetup& view, Rende
 
 void SceneRenderer::SettleExposure(const ExposureSettings& settings) {
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
-    renderer_->Context().Submit([&](VkCommandBuffer cmd) {
-        BeginLabel(cmd, "settle exposure");
+    // One submission per pass: this is the first GPU work of a newly loaded stage, and on drivers without VK_EXT_device_fault or
+    // checkpoints (nxvk, ouncevk) the label of the failing submission is the only way the log can name the pass that lost the device.
+    // It runs once per stage load, so the extra waits cost nothing noticeable.
+    vk::Context& ctx = renderer_->Context();
+    ctx.Submit([&](VkCommandBuffer cmd) {
         BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
         RecordShadows(cmd);
+    }, "settle exposure: shadows");
+    ctx.Submit([&](VkCommandBuffer cmd) {
+        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
         RecordGBuffer(cmd, main_view_);
-        RecordLighting(cmd, main_view_);
-        RecordLuminance(cmd);
-        EndLabel(cmd);
-    });
+    }, "settle exposure: g-buffer");
+    ctx.Submit([&](VkCommandBuffer cmd) {
+        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        RecordLighting(cmd, main_view_, kLightingProbes);
+    }, "settle exposure: lighting, probes");
+    ctx.Submit([&](VkCommandBuffer cmd) {
+        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        RecordLighting(cmd, main_view_, kLightingHalfLights);
+    }, "settle exposure: lighting, half-resolution lights");
+    ctx.Submit([&](VkCommandBuffer cmd) {
+        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        RecordLighting(cmd, main_view_, kLightingResolve);
+    }, "settle exposure: lighting, resolve");
+    ctx.Submit([&](VkCommandBuffer cmd) { RecordLuminance(cmd); }, "settle exposure: luminance");
     vmaInvalidateAllocation(renderer_->Context().allocator, slot.luminance.allocation, 0, VK_WHOLE_SIZE);
     const glm::vec2* partial = static_cast<const glm::vec2*>(slot.luminance.mapped);
     double sum = 0.0;
@@ -3043,6 +3140,7 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
         return;
     }
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
+    Trail("render: flush materials");
     textures_->FlushMaterials();
     if (has_last_eye_ && glm::distance(camera.position, last_eye_) > kCameraCutDistance) {
         adaptation_valid_ = false;
@@ -3050,8 +3148,11 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     last_eye_ = camera.position;
     has_last_eye_ = true;
     lighting_ = lighting.valid ? &lighting : &fallback_;
+    Trail("render: color LUT");
     UpdateColorLut(lighting_->screen);
+    Trail("render: reflection texture");
     UpdateReflectionTexture(lighting_->reflection_texture);
+    Trail("render: read measurements");
     ReadMeasurements(slot, dt, lighting_->exposure);
     if (lighting_->exposure.pinned) {
         ev_ = lighting_->exposure.pinned_ev;
@@ -3089,6 +3190,7 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     } else {
         exposure_ = renderer_->exposure;
     }
+    Trail("render: motion");
     UpdateMotion(camera, dt);
     rt_active_ = rt_ && raytracing.shadows && toggles.shadows;
     rt_reflections_ = rt_ && reflect_make_rt_ && raytracing.reflections && toggles.local_reflections;
@@ -3098,10 +3200,13 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
         rt_ao_history_ = false;
     }
     rt_ao_ready_ = false;
+    Trail("render: dominant light");
     UpdateDominantLight(camera, *lighting_, timed_ ? pending_time_ : dt);
     pending_time_ = 0.0f;
+    Trail("render: prepare frame (draws, lights, views)");
     PrepareFrame(camera, items, *lighting_);
     SetTppFog(lighting_->tpp);
+    Trail("render: upload frame data");
     UploadFrame(slot);
     if (!adaptation_valid_ && lighting_->valid && toggles.adaptation) {
         SettleExposure(lighting_->exposure);
@@ -3112,6 +3217,8 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
         vkCmdResetQueryPool(cmd, slot.upscale_queries, 0, 4);
     }
     queries_ = slot.queries;
+    slot.stamps_written = 0;
+    stamps_written_ = &slot.stamps_written;
     Stamp(cmd, 0);
     BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     BeginLabel(cmd, "shadows");
@@ -3200,6 +3307,7 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     }
     Stamp(cmd, 2);
     RecordView(cmd, main_view_, hdr_, true);
+    Trail("render: reflection sample");
     RecordReflectionSample(cmd, *lighting_);
     BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     if (debug_view == DebugView::Lit || debug_view == DebugView::Ambient) {
@@ -3238,6 +3346,7 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     }
     Stamp(cmd, 6);
     queries_ = VK_NULL_HANDLE;
+    stamps_written_ = nullptr;
     last_timed_slot_ = renderer_->FrameIndex();
     slot.timed = true;
     slot.measured = true;

@@ -72,10 +72,13 @@ float PointShadowW(Light l, View v, vec3 world, vec3 frag) {
 bool EvaluateLightW(Light l, uint index, View v, SurfaceW s, bool shadows, vec2 frag, out vec3 diffuse, out vec3 specular) {
     diffuse = vec3(0.0);
     specular = vec3(0.0);
+    // Area lights reach only the pixels inside their box. A pixel outside gets no radiance, and the radiance test below drops the light;
+    // returning early here instead lost the GPU device on the Switch 2 (ouncevk, NAK compiler), with the same matrix read
+    float area_inside = 1.0;
     if (l.info.z != 0) {
         vec3 q = (LT_AREA(l) * vec4(s.world, 1.0)).xyz;
         if (1.0 - max(abs(q.z), max(abs(q.x), abs(q.y))) < 0.0) {
-            return false;
+            area_inside = 0.0;
         }
     }
     bool spot = l.position.w > 0.5;
@@ -85,7 +88,7 @@ bool EvaluateLightW(Light l, uint index, View v, SurfaceW s, bool shadows, vec2 
     float d = spot ? max(l.range.y, dist + l.range.x) : max(l.range.y, dist) + l.range.x;
     float d2 = d * d;
     float att = max(0.0, 1.0 / d2 - d2 * l.range.z);
-    vec3 radiance = l.color.rgb * att * v.exposure.x;
+    vec3 radiance = l.color.rgb * att * v.exposure.x * area_inside;
     float cos_a = 1.0;
     if (spot) {
         cos_a = dot(l.direction.xyz, -L);

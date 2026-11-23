@@ -12,6 +12,15 @@ project(pt_switch LANGUAGES C CXX)
 if(NOT PT_SWITCH)
   message(FATAL_ERROR "configure with -DCMAKE_TOOLCHAIN_FILE=cmake/switch.cmake (path relative to the repository root)")
 endif()
+# Switch 2 (cmake/switch2.cmake, ounce-devkit): libounce in place of libnx, Vulkan from ouncevk in place of nxvk
+option(PT_SWITCH2 "Build for Switch 2 with ounce-devkit (libounce, ouncevk)" OFF)
+if(PT_SWITCH2)
+  # cmake/switch.cmake passes PT_SWITCH in the flags; libounce's toolchain sets its own, so it is defined here
+  add_compile_definitions(PT_SWITCH=1)
+  # zlib, harfbuzz, freetype, libpng and bzip2 come from devkitPro's Switch portlibs (C only, they link into Switch 2 programs);
+  # libounce's toolchain links that directory but puts only the Switch 2 portlibs on the include path
+  include_directories(SYSTEM $ENV{DEVKITPRO}/portlibs/switch/include)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,9 +49,19 @@ FetchContent_Declare(ogg GIT_REPOSITORY https://github.com/xiph/ogg.git GIT_TAG 
 FetchContent_Declare(vorbis GIT_REPOSITORY https://github.com/xiph/vorbis.git GIT_TAG v1.3.7 GIT_SHALLOW TRUE)
 FetchContent_Declare(bc7enc URL https://codeload.github.com/richgel999/bc7enc_rdo/zip/b9438627eef73a1157e84201b6fa6eb2ffd6d9f0)
 FetchContent_Declare(expat GIT_REPOSITORY https://github.com/libexpat/libexpat.git GIT_TAG R_2_6_4 GIT_SHALLOW TRUE)
-foreach(dep vkheaders volk vma glm imgui stb lua51 ogg vorbis bc7enc expat)
+set(PT_FETCH vkheaders volk vma glm imgui stb lua51 ogg vorbis bc7enc)
+if(NOT PT_SWITCH2)
+  list(APPEND PT_FETCH expat)  # for nxvk's driconf parsing
+endif()
+foreach(dep ${PT_FETCH})
   FetchContent_Populate(${dep})
 endforeach()
+# the Vulkan driver's own headers go after the Khronos ones; ouncevk's are on the toolchain's standard include path
+if(PT_SWITCH2)
+  set(PT_VK_DRIVER_INCLUDE)
+else()
+  set(PT_VK_DRIVER_INCLUDE ${PT_NXVK_DIR})
+endif()
 
 # ---- third party code -------------------------------------------------------------------------------------------------------
 
@@ -62,7 +81,7 @@ add_library(pt_thirdparty STATIC
 # the platform layer headers (SDL3/, dlfcn.h, imgui_impl_sdl3.h) come first, nxvk's vulkan/ headers over the Khronos ones
 target_include_directories(pt_thirdparty PUBLIC
   ${PT_ROOT}/src/platform/switch
-  ${PT_NXVK_DIR}
+  ${PT_VK_DRIVER_INCLUDE}
   ${vkheaders_SOURCE_DIR}/include
   ${volk_SOURCE_DIR}
   ${vma_SOURCE_DIR}/include
@@ -114,6 +133,7 @@ target_include_directories(pt_vorbis PUBLIC ${ogg_SOURCE_DIR}/include ${vorbis_S
 target_compile_options(pt_vorbis PRIVATE -w)
 
 # libexpat: nxvk's driconf parsing needs it and devkitPro ships no build of it
+if(NOT PT_SWITCH2)
 set(EXPAT_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(EXPAT_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(EXPAT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -123,6 +143,7 @@ set(EXPAT_BUILD_FUZZERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${expat_SOURCE_DIR}/expat ${CMAKE_BINARY_DIR}/_deps/expat-build EXCLUDE_FROM_ALL)
 # newlib declares arc4random_buf only under _GNU_SOURCE (C++ has it by default)
 target_compile_definitions(expat PRIVATE _GNU_SOURCE)
+endif()
 
 # ---- generated headers (as ../CMakeLists.txt makes them) ----------------------------------------------------------------------
 
@@ -152,8 +173,10 @@ list(APPEND SOURCES
   ${PT_ROOT}/src/main.cpp
   ${PT_ROOT}/src/platform/switch/sdl_switch.cpp
   ${PT_ROOT}/src/platform/switch/switch_stubs.cpp
-  ${PT_ROOT}/src/platform/switch/lsfg_bridge.cpp
-  ${PT_NXVK_SRC}/switch/smoke/nvk_compat.c)
+  ${PT_ROOT}/src/platform/switch/lsfg_bridge.cpp)
+if(NOT PT_SWITCH2)
+  list(APPEND SOURCES ${PT_NXVK_SRC}/switch/smoke/nvk_compat.c)
+endif()
 
 # LSFG frame generation (GPL-3.0-or-later, third_party/lsfg-vk): its shaders are read from the user's Lossless.dll at run time
 file(GLOB_RECURSE LSFG_SOURCES CONFIGURE_DEPENDS ${PT_ROOT}/third_party/lsfg-vk/lsfg-vk-*/src/*.cpp)
@@ -174,6 +197,24 @@ target_compile_definitions(pt PRIVATE PT_GAMEPLUS=1)
 target_compile_options(pt PRIVATE -ffunction-sections -fdata-sections)
 target_link_libraries(pt PRIVATE pt_lsfg pt_thirdparty pt_vorbis)
 
+if(PT_SWITCH2)
+  # ouncevk: libouncevk.a is one prelinked object that defines every vk* entry point, and volk (VK_NO_PROTOTYPES) defines the same
+  # names as function pointers. The program links a copy whose vk* symbols are local to the driver object, with vkGetInstanceProcAddr
+  # exported as vk_icdGetInstanceProcAddr, the entry point the platform layer and vk_context.cpp take from nxvk.
+  set(PT_OUNCEVK_LIB "$ENV{DEVKITPRO}/portlibs/switch2/lib/libouncevk.a")
+  if(NOT EXISTS ${PT_OUNCEVK_LIB})
+    message(FATAL_ERROR "${PT_OUNCEVK_LIB} not found: install ounce-devkit (dkp-pacman -S ounce-devkit)")
+  endif()
+  set(PT_OUNCEVK_LOCAL ${CMAKE_BINARY_DIR}/ouncevk/libpt_ouncevk.a)
+  add_custom_command(OUTPUT ${PT_OUNCEVK_LOCAL}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/ouncevk
+    COMMAND ${CMAKE_OBJCOPY} --redefine-sym vkGetInstanceProcAddr=vk_icdGetInstanceProcAddr
+            --wildcard --localize-symbol=vk[A-Z]* ${PT_OUNCEVK_LIB} ${PT_OUNCEVK_LOCAL}
+    DEPENDS ${PT_OUNCEVK_LIB} VERBATIM)
+  add_custom_target(pt_ouncevk DEPENDS ${PT_OUNCEVK_LOCAL})
+  add_dependencies(pt pt_ouncevk)
+  target_link_libraries(pt PRIVATE ${PT_OUNCEVK_LOCAL} -lharfbuzz -lfreetype -lpng16 -lbz2 -lz -lnx -lm -lstdc++ -pthread)
+else()
 # nxvk: link flags as the driver's README requires (whole archive, the entry point kept, gc of the rest)
 set(NXVK_LIBS
   -L${PT_NXVK_DIR}/lib
@@ -184,6 +225,7 @@ set(NXVK_LIBS
 target_link_libraries(pt PRIVATE ${NXVK_LIBS} expat -lharfbuzz -lfreetype -lpng16 -lbz2 -lz -lnx -lm -lstdc++ -pthread)
 if(NOT EXISTS ${PT_NXVK_DIR}/lib/libnvk.a)
   message(WARNING "nxvk is not built yet (${PT_NXVK_DIR}/lib/libnvk.a missing): the objects compile, the link will fail until it is")
+endif()
 endif()
 
 # ---- shaders (SPIR-V) ----------------------------------------------------------------------------------------------------------

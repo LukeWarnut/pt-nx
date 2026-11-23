@@ -69,6 +69,9 @@ public:
     uint64_t presents = 0;            // images handed to the presentation engine, and how many of them were generated frames
     uint64_t generated_presents = 0;
     std::function<const vk::Image*(uint32_t)> hudless;
+    // Switch 2 bring-up: called once when a frame's GPU work is still unfinished 250 ms after the CPU began waiting for it (a GPU hang), with
+    // the frame index, so the scene can log how far its work got
+    std::function<void(uint32_t)> on_late_frame;
     // where a frame's time goes (filled every frame): CPU blocked on the frame fence, on the swapchain image, in present, and the
     // whole frame's GPU time (first to last command, scene + composite + UI), read back two frames later
     struct FrameTiming {
