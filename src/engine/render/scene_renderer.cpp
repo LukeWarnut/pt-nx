@@ -694,6 +694,12 @@ void SceneRenderer::Shutdown() {
     }
     DestroyPipelines();
     DestroyTargets();
+    for (auto& [frame, images] : retired_images_) {
+        for (vk::Image& image : images) {
+            ctx.DestroyImage(image);
+        }
+    }
+    retired_images_.clear();
     ctx.DestroyBuffer(dump_compose_);
     ctx.DestroyBuffer(dump_forward_);
     ctx.DestroyBuffer(dump_scene_);
@@ -729,8 +735,16 @@ bool SceneRenderer::CreateTarget(RenderTarget& target, VkFormat format, VkExtent
     return renderer_->Context().CreateImage(target.image, format, {std::max(extent.width, 1u), std::max(extent.height, 1u), 1}, usage, 1, 1, aspect);
 }
 
-void SceneRenderer::DestroyTargets() {
+void SceneRenderer::DestroyTargets(std::vector<vk::Image>* retire) {
     vk::Context& ctx = renderer_->Context();
+    const auto drop = [&](vk::Image& image) {
+        if (retire && image.image) {
+            retire->push_back(image);
+            image = vk::Image{};
+        } else {
+            ctx.DestroyImage(image);
+        }
+    };
     RenderTarget* targets[] = {&albedo_, &normal_, &material_, &depth_, &diffuse_, &specular_, &probe_acc_, &light_half_[0], &light_half_[1], &hdr_, &bloom_[0], &bloom_[1], &bloom_[2],
                                &flare_, &ldr_[0], &ldr_[1], &history_, &taa_history_, &smaa_edges_, &smaa_weights_, &mirror_, &ao_[0], &ao_[1], &refmap_, &hdr_copy_, &particles_, &particles_half_, &depth_half_, &dof_half_,
                                &dof_quarter_[0], &dof_quarter_[1], &dof_eighth_[0], &dof_eighth_[1], &velocity_, &object_velocity_,
@@ -738,14 +752,14 @@ void SceneRenderer::DestroyTargets() {
                                &mb_blur_[0], &mb_blur_[1], &mirror_history_, &mirror_temporal_, &reflect_layer_, &reflect_offset_,
                                &reflect_history_[0], &reflect_history_[1]};
     for (RenderTarget* t : targets) {
-        ctx.DestroyImage(t->image);
+        drop(t->image);
         *t = RenderTarget{};
     }
-    ctx.DestroyImage(refmap_color_.image);
+    drop(refmap_color_.image);
     refmap_color_ = RenderTarget{};
     sss_.DestroyTargets();
     for (RenderTarget& t : rt_ao_images_) {
-        ctx.DestroyImage(t.image);
+        drop(t.image);
         t = RenderTarget{};
     }
     rt_ao_history_ = false;
@@ -765,8 +779,21 @@ bool SceneRenderer::EnsureTargets(VkExtent2D extent, VkExtent2D output, bool ups
         output.height == output_extent_.height && upscaling == targets_upscaled_) {
         return true;
     }
-    vkDeviceWaitIdle(device_);
-    DestroyTargets();
+    // A size change while playing (dynamic resolution) does not wait for the GPU: that wait plus the re-creation was a 40-50 ms frame each
+    // time the scene got heavier (doors opening). The old images are kept until the frame still in flight is done, the new ones are cleared
+    // in this frame's command buffer, and only this frame slot's descriptor sets are written now. The first creation, upscaling and the
+    // subsurface pass (the ending) keep the waiting path.
+    const auto resize_start = std::chrono::steady_clock::now();
+    const bool sss_recent = sss_used_ && frame_counter_ < sss_last_frame_ + Renderer::kFramesInFlight + 2;
+    const bool no_wait = extent_.width > 0 && !upscaling && !targets_upscaled_ && !sss_recent && !renderer_->frame_generation &&
+                         renderer_->Cmd() != VK_NULL_HANDLE;
+    if (no_wait) {
+        retired_images_.emplace_back(frame_counter_, std::vector<vk::Image>{});
+        DestroyTargets(&retired_images_.back().second);
+    } else {
+        vkDeviceWaitIdle(device_);
+        DestroyTargets();
+    }
     mirror_stale_.valid = false;
     const VkImageUsageFlags color = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     const VkImageUsageFlags dumped = color | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -820,58 +847,75 @@ bool SceneRenderer::EnsureTargets(VkExtent2D extent, VkExtent2D output, bool ups
                  CreateTarget(reflect_history_[0], kHdrFormat, extent, color, c) &&
                  CreateTarget(reflect_history_[1], kHdrFormat, extent, color, c)));
     ok = ok && (!rt_ || CreateTarget(refmap_color_, kRefMapFormat, extent, color, c));
-    ok = ok && (!sss_ready_ || sss_.CreateTargets(extent));
+    sss_stale_ = no_wait && sss_ready_;
+    ok = ok && (!sss_ready_ || no_wait || sss_.CreateTargets(extent));
     if (!ok) {
         LogError("scene renderer: cannot create render targets {}x{}", extent.width, extent.height);
         return false;
     }
-    renderer_->Context().Submit([&](VkCommandBuffer cmd) {
-        RenderTarget* colors[] = {&albedo_, &normal_, &material_, &diffuse_, &specular_, &probe_acc_, &light_half_[0], &light_half_[1], &hdr_, &mirror_, &bloom_[0], &bloom_[1], &bloom_[2],
-                                  &flare_, &ldr_[0], &ldr_[1], &history_, &taa_history_, &smaa_edges_, &smaa_weights_, &ao_[0], &ao_[1], &refmap_, &hdr_copy_, &particles_, &dof_half_,
-                                  &dof_quarter_[0], &dof_quarter_[1], &dof_eighth_[0], &dof_eighth_[1], &velocity_, &object_velocity_, &mb_tile_[0],
-                                  &mb_tile_[1], &mb_tile_[2], &mb_tile_[3], &mb_tile_[4], &mb_neighbour_, &mb_bake_, &mb_blur_[0],
-                                  &mb_blur_[1]};
-        for (RenderTarget* t : colors) {
+    if (no_wait) {
+        RecordTargetClears(renderer_->Cmd(), extent);
+    } else {
+        renderer_->Context().Submit([&](VkCommandBuffer cmd) { RecordTargetClears(cmd, extent); });
+    }
+    extent_ = extent;
+    output_extent_ = output;
+    targets_upscaled_ = upscaling;
+    history_valid_ = false;
+    if (no_wait) {
+        const uint32_t current = 1u << renderer_->FrameIndex();
+        WriteImageDescriptors(current);
+        descriptor_dirty_slots_ = ((1u << Renderer::kFramesInFlight) - 1u) & ~current;
+    } else {
+        WriteImageDescriptors();
+        descriptor_dirty_slots_ = 0;
+    }
+    LogInfo("scene renderer: targets {}x{} in {:.1f} ms{}", extent.width, extent.height,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - resize_start).count(),
+            no_wait ? " (no GPU wait)" : "");
+    return true;
+}
+
+void SceneRenderer::RecordTargetClears(VkCommandBuffer cmd, VkExtent2D extent) {
+    RenderTarget* colors[] = {&albedo_, &normal_, &material_, &diffuse_, &specular_, &probe_acc_, &light_half_[0], &light_half_[1], &hdr_, &mirror_, &bloom_[0], &bloom_[1], &bloom_[2],
+                              &flare_, &ldr_[0], &ldr_[1], &history_, &taa_history_, &smaa_edges_, &smaa_weights_, &ao_[0], &ao_[1], &refmap_, &hdr_copy_, &particles_, &dof_half_,
+                              &dof_quarter_[0], &dof_quarter_[1], &dof_eighth_[0], &dof_eighth_[1], &velocity_, &object_velocity_, &mb_tile_[0],
+                              &mb_tile_[1], &mb_tile_[2], &mb_tile_[3], &mb_tile_[4], &mb_neighbour_, &mb_bake_, &mb_blur_[0],
+                              &mb_blur_[1]};
+    for (RenderTarget* t : colors) {
+        UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
+        BeginPass(cmd, t->Extent(), {{t, true, {}}});
+        vkCmdEndRendering(cmd);
+        UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    }
+    UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
+    BeginPass(cmd, extent, {}, &depth_, false, true);
+    vkCmdEndRendering(cmd);
+    UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
+    RenderTarget* upscale_colors[] = {&motion_, &reactive_, &opaque_, &post_hdr_, &post_depth_, &post_object_velocity_, &refmap_color_,
+                                     &mirror_history_, &mirror_temporal_, &reflect_layer_, &reflect_offset_, &reflect_history_[0],
+                                     &reflect_history_[1]};
+    for (RenderTarget* t : upscale_colors) {
+        if (t->Valid()) {
             UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
             BeginPass(cmd, t->Extent(), {{t, true, {}}});
             vkCmdEndRendering(cmd);
             UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
         }
-        UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL}});
-        BeginPass(cmd, extent, {}, &depth_, false, true);
-        vkCmdEndRendering(cmd);
-        UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-        RenderTarget* upscale_colors[] = {&motion_, &reactive_, &opaque_, &post_hdr_, &post_depth_, &post_object_velocity_, &refmap_color_,
-                                         &mirror_history_, &mirror_temporal_, &reflect_layer_, &reflect_offset_, &reflect_history_[0],
-                                         &reflect_history_[1]};
-        for (RenderTarget* t : upscale_colors) {
-            if (t->Valid()) {
-                UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
-                BeginPass(cmd, t->Extent(), {{t, true, {}}});
-                vkCmdEndRendering(cmd);
-                UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-            }
+    }
+    RenderTarget* upscale_storage[] = {&upscaled_, &exposure_image_};
+    for (RenderTarget* t : upscale_storage) {
+        if (t->Valid()) {
+            UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+            const VkClearColorValue zero{};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, t->image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
         }
-        RenderTarget* upscale_storage[] = {&upscaled_, &exposure_image_};
-        for (RenderTarget* t : upscale_storage) {
-            if (t->Valid()) {
-                UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-                const VkClearColorValue zero{};
-                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdClearColorImage(cmd, t->image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
-                UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
-            }
-        }
-    });
-    extent_ = extent;
-    output_extent_ = output;
-    targets_upscaled_ = upscaling;
-    history_valid_ = false;
-    WriteImageDescriptors();
-    return true;
+    }
 }
 
-void SceneRenderer::WriteImageDescriptors() {
+void SceneRenderer::WriteImageDescriptors(uint32_t slot_mask) {
     VkDescriptorImageInfo images[gpu::kImageSlots];
     for (VkDescriptorImageInfo& info : images) {
         info = {VK_NULL_HANDLE, white_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -960,6 +1004,9 @@ void SceneRenderer::WriteImageDescriptors() {
     std::copy(std::begin(images), std::end(images), std::begin(post_images));
     WriteUpscaleDescriptors(post_images, true);
     for (int set_index = 0; set_index < 2 * static_cast<int>(Renderer::kFramesInFlight); ++set_index) {
+        if ((slot_mask & (1u << (set_index / 2))) == 0) {
+            continue;
+        }
         FrameSlot& slot = slots_[set_index / 2];
         const bool post = (set_index & 1) != 0;
         VkDescriptorBufferInfo frame_info{slot.frame_data.buffer, 0, VK_WHOLE_SIZE};

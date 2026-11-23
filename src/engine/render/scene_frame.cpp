@@ -2956,7 +2956,12 @@ void SceneRenderer::RecordView(VkCommandBuffer cmd, const ViewSetup& view, Rende
         const char* v = std::getenv("PT_SUBSURFACE");
         return v && v[0] == '0';
     }();
-    if (main_view && sss_ready_ && !sss_off && lighting_->valid && lighting_->screen.subsurface_scatter && toggles.subsurface_scatter) {
+    if (main_view && sss_ready_ && !sss_off && lighting_->valid && lighting_->screen.subsurface_scatter && toggles.subsurface_scatter && sss_stale_) {
+        sss_stale_ = !sss_.CreateTargets(extent_);  // left out by a render size change without a GPU wait (EnsureTargets)
+    }
+    if (main_view && sss_ready_ && !sss_off && !sss_stale_ && lighting_->valid && lighting_->screen.subsurface_scatter && toggles.subsurface_scatter) {
+        sss_used_ = true;
+        sss_last_frame_ = frame_counter_;
         BeginLabel(cmd, "subsurface scattering");
         sss_.Record(cmd, diffuse_, view.index, [&] { BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS); });
         EndLabel(cmd);
@@ -3138,6 +3143,22 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     const bool upscaling = BeginUpscaleFrame(output);
     if (!EnsureTargets(upscaling ? up_.render : output, output, upscaling)) {
         return;
+    }
+    // after a render size change without a GPU wait: this slot's last frame is done (its fence was waited for in BeginFrame), so its sets
+    // can take the new images now, and images retired three frames ago are unused
+    if (const uint32_t bit = 1u << renderer_->FrameIndex(); (descriptor_dirty_slots_ & bit) != 0) {
+        WriteImageDescriptors(bit);
+        descriptor_dirty_slots_ &= ~bit;
+    }
+    for (auto it = retired_images_.begin(); it != retired_images_.end();) {
+        if (frame_counter_ >= it->first + Renderer::kFramesInFlight + 1) {
+            for (vk::Image& image : it->second) {
+                renderer_->Context().DestroyImage(image);
+            }
+            it = retired_images_.erase(it);
+        } else {
+            ++it;
+        }
     }
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
     Trail("render: flush materials");

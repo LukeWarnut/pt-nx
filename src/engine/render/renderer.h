@@ -113,7 +113,7 @@ private:
 #endif
     bool InitImGui(SDL_Window* window);
     void Composite(VkCommandBuffer cmd, VkDescriptorSet set, float mode, VkExtent2D extent, VkOffset2D offset = {0, 0});
-    void WriteCompositeSets();
+    void WriteCompositeSets(uint32_t slot_mask = ~0u);  // the composite and final sets of the frame slots in the mask
     void WriteFgSet(VkImageView generated);
     void RecordXr(VkCommandBuffer cmd);
     void CopyToXr(VkCommandBuffer cmd, VkDescriptorSet set, const XrTarget& target, bool premultiplied);
@@ -153,8 +153,16 @@ private:
     VkImageView grain_noise_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout composite_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool composite_pool_ = VK_NULL_HANDLE;
+    // One composite and one final set per frame slot, so a new render size can be written into the slot about to record while the other
+    // slot's frame may still be on the GPU; composite_set_ / final_set_ are the current slot's (set in BeginFrame)
+    VkDescriptorSet composite_sets_[kFramesInFlight] = {};
+    VkDescriptorSet final_sets_[kFramesInFlight] = {};
+    uint32_t composite_dirty_slots_ = 0;
     VkDescriptorSet composite_set_ = VK_NULL_HANDLE;
     VkDescriptorSet final_set_ = VK_NULL_HANDLE;
+    // targets replaced by a render size change, destroyed once no frame in flight can use them (BeginFrame)
+    std::vector<std::pair<uint64_t, vk::Image>> retired_images_;
+    uint64_t frames_begun_ = 0;
     VkDescriptorSet fg_set_ = VK_NULL_HANDLE;  // the final pass reading the generated image
     VkImageView fg_view_ = VK_NULL_HANDLE;
     VkImageView fg_noise_ = VK_NULL_HANDLE;

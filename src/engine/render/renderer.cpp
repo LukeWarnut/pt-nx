@@ -175,12 +175,14 @@ bool Renderer::CreateTargets(uint32_t width, uint32_t height) {
     if (!ctx_.CreateImage(final_, output_format_, extent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
         return false;
     }
-    WriteCompositeSets();
+    // all slots, unless a render size change without a GPU wait asked for the current slot only (composite_dirty_slots_ holds the others)
+    const uint32_t all = (1u << kFramesInFlight) - 1u;
+    WriteCompositeSets(composite_dirty_slots_ == all ? (1u << frame_index_) : all);
     return true;
 }
 
-void Renderer::WriteCompositeSets() {
-    if (!composite_set_ || !final_set_) {
+void Renderer::WriteCompositeSets(uint32_t slot_mask) {
+    if (!composite_sets_[0] || !final_sets_[0]) {
         return;
     }
     const VkImageView noise = grain_noise_ ? grain_noise_ : scene_color_.view;
@@ -188,16 +190,21 @@ void Renderer::WriteCompositeSets() {
                                       {linear_sampler_, final_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                       {wrap_sampler_, noise, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                                       {wrap_sampler_, noise, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
-    VkWriteDescriptorSet writes[4]{};
-    for (int i = 0; i < 4; ++i) {
-        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        writes[i].dstSet = i % 2 == 0 ? composite_set_ : final_set_;
-        writes[i].dstBinding = i < 2 ? 0 : 1;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[i].pImageInfo = &infos[i];
+    for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+        if ((slot_mask & (1u << slot)) == 0) {
+            continue;
+        }
+        VkWriteDescriptorSet writes[4]{};
+        for (int i = 0; i < 4; ++i) {
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = i % 2 == 0 ? composite_sets_[slot] : final_sets_[slot];
+            writes[i].dstBinding = i < 2 ? 0 : 1;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &infos[i];
+        }
+        vkUpdateDescriptorSets(ctx_.device, 4, writes, 0, nullptr);
     }
-    vkUpdateDescriptorSets(ctx_.device, 4, writes, 0, nullptr);
 }
 
 void Renderer::WriteFgSet(VkImageView generated) {
@@ -234,6 +241,10 @@ void Renderer::SetGrainNoise(VkImageView view) {
 }
 
 void Renderer::DestroyTargets() {
+    for (auto& [frame, image] : retired_images_) {
+        ctx_.DestroyImage(image);
+    }
+    retired_images_.clear();
     ctx_.DestroyImage(scene_color_);
     ctx_.DestroyImage(final_);
     ctx_.DestroyImage(output_);
@@ -246,22 +257,28 @@ bool Renderer::CreateCompositePipeline(VkFormat output_format) {
     set_info.bindingCount = 2;
     set_info.pBindings = bindings;
     vkCreateDescriptorSetLayout(ctx_.device, &set_info, nullptr, &composite_set_layout_);
-    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 6};
+    constexpr uint32_t kSets = 2 * kFramesInFlight + 1;  // composite and final per frame slot, and the frame generation set
+    VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * kSets};
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pool_info.maxSets = 3;
+    pool_info.maxSets = kSets;
     pool_info.poolSizeCount = 1;
     pool_info.pPoolSizes = &pool_size;
     vkCreateDescriptorPool(ctx_.device, &pool_info, nullptr, &composite_pool_);
-    const VkDescriptorSetLayout layouts[3] = {composite_set_layout_, composite_set_layout_, composite_set_layout_};
-    VkDescriptorSet sets[3] = {};
+    VkDescriptorSetLayout layouts[kSets];
+    std::fill(std::begin(layouts), std::end(layouts), composite_set_layout_);
+    VkDescriptorSet sets[kSets] = {};
     VkDescriptorSetAllocateInfo alloc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     alloc.descriptorPool = composite_pool_;
-    alloc.descriptorSetCount = 3;
+    alloc.descriptorSetCount = kSets;
     alloc.pSetLayouts = layouts;
     vkAllocateDescriptorSets(ctx_.device, &alloc, sets);
-    composite_set_ = sets[0];
-    final_set_ = sets[1];
-    fg_set_ = sets[2];
+    for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+        composite_sets_[slot] = sets[2 * slot];
+        final_sets_[slot] = sets[2 * slot + 1];
+    }
+    fg_set_ = sets[2 * kFramesInFlight];
+    composite_set_ = composite_sets_[frame_index_];
+    final_set_ = final_sets_[frame_index_];
     WriteCompositeSets();
 
     VkPushConstantRange push{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
@@ -421,15 +438,50 @@ bool Renderer::BeginFrame(bool present) {
         }
     }
     grain[0] = 0.0f;
+    ++frames_begun_;
+    // this slot's fence is signalled: images retired two or more frames ago are no longer used by any frame in flight
+    for (auto it = retired_images_.begin(); it != retired_images_.end();) {
+        if (frames_begun_ >= it->first + kFramesInFlight) {
+            ctx_.DestroyImage(it->second);
+            it = retired_images_.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (render_extent_.width > 0 && render_extent_.height > 0 &&
         (scene_color_.extent.width != render_extent_.width || scene_color_.extent.height != render_extent_.height)) {
-        vkDeviceWaitIdle(ctx_.device);
-        DestroyTargets();
-        if (!CreateTargets(render_extent_.width, render_extent_.height)) {
-            return false;
+        const auto resize_start = std::chrono::steady_clock::now();
+        if (!scene_color_.image || frame_generation) {
+            vkDeviceWaitIdle(ctx_.device);
+            DestroyTargets();
+            if (!CreateTargets(render_extent_.width, render_extent_.height)) {
+                return false;
+            }
+        } else {
+            // A new render size (dynamic resolution) without waiting for the GPU: the old images stay alive for the frame still in flight,
+            // and only this slot's sets are written now (the other slot's are written when its fence has been waited for)
+            for (vk::Image* image : {&scene_color_, &final_, &output_}) {
+                if (image->image) {
+                    retired_images_.emplace_back(frames_begun_, *image);
+                }
+                *image = vk::Image{};
+            }
+            const uint32_t all = (1u << kFramesInFlight) - 1u;
+            composite_dirty_slots_ = all;
+            if (!CreateTargets(render_extent_.width, render_extent_.height)) {
+                return false;
+            }
+            composite_dirty_slots_ = all & ~(1u << frame_index_);
         }
-        LogInfo("renderer: render size {}x{} (VR)", render_extent_.width, render_extent_.height);
+        LogInfo("renderer: render size {}x{} ({:.1f} ms)", render_extent_.width, render_extent_.height,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - resize_start).count());
     }
+    if ((composite_dirty_slots_ & (1u << frame_index_)) != 0) {
+        WriteCompositeSets(1u << frame_index_);
+        composite_dirty_slots_ &= ~(1u << frame_index_);
+    }
+    composite_set_ = composite_sets_[frame_index_];
+    final_set_ = final_sets_[frame_index_];
     presenting_ = window_ && present;
     if (presenting_) {
         if (swapchain_dirty_) {

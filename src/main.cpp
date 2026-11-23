@@ -3913,8 +3913,11 @@ int RunGame(App& app, pt::Vfs& vfs) {
 #endif
             last_ticks = now;
 #ifdef PT_SWITCH
-            if (dt > 0.040f) ++g_switch_slow_frames;
-            if (dt > 0.045f && g_slow_log.size() < 24) {  // when slow frames happen (diagnostic for the periodic stutter)
+            // a slow frame: more than one frame period late (30 fps lock: over 40 / 45 ms; 60 fps: over 25 ms, a missed VBlank)
+            const float slow_count = g_switch_gfx.lock30 ? 0.040f : 0.025f;
+            const float slow_log = g_switch_gfx.lock30 ? 0.045f : 0.025f;
+            if (dt > slow_count) ++g_switch_slow_frames;
+            if (dt > slow_log && g_slow_log.size() < 24) {  // when slow frames happen (diagnostic for the periodic stutter)
                 g_slow_log.push_back({static_cast<double>(now) * 1e-9, dt * 1000.0f});
             }
             {
@@ -5358,7 +5361,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
 #ifdef PT_SWITCH
                 {
                     unsigned cpu_hz = 0, gpu_hz = 0;
-                    if (pt_switch_clocks(&cpu_hz, &gpu_hz)) pt::LogInfo("clocks: cpu {} MHz, gpu {} MHz, memory {} MHz | frames over 40 ms {} | lock30 {}",
+                    if (pt_switch_clocks(&cpu_hz, &gpu_hz)) pt::LogInfo("clocks: cpu {} MHz, gpu {} MHz, memory {} MHz | slow frames {} | lock30 {}",
                                                                          cpu_hz / 1000000u, gpu_hz / 1000000u, pt_switch_mem_hz() / 1000000u,
                                                                          g_switch_slow_frames, g_switch_gfx.lock30);
                     g_switch_slow_frames = 0;
@@ -5403,8 +5406,8 @@ int RunGame(App& app, pt::Vfs& vfs) {
                 {
                     std::string slow;
                     for (const SlowFrame& f : g_slow_log) slow += std::format(" {:.2f}s({:.0f}ms)", f.at_s, f.ms);
-                    pt::LogInfo("stutter: status block at {:.2f}s, previous block took {:.1f} ms; slow frames (>45 ms) since:{}", status_tick_ns * 1e-9,
-                                g_status_block_ms, slow.empty() ? " none" : slow);
+                    pt::LogInfo("stutter: status block at {:.2f}s, previous block took {:.1f} ms; slow frames (>{} ms) since:{}", status_tick_ns * 1e-9,
+                                g_status_block_ms, g_switch_gfx.lock30 ? 45 : 25, slow.empty() ? " none" : slow);
                     g_slow_log.clear();
                     g_status_block_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - status_now).count();
                 }

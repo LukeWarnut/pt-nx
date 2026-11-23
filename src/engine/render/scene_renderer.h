@@ -326,8 +326,10 @@ private:
     void DestroyPipelines();
     bool CreateDescriptors();
     bool EnsureTargets(VkExtent2D extent, VkExtent2D output, bool upscaling);
-    void DestroyTargets();
-    void WriteImageDescriptors();
+    // retire: the images go to retired_images_ (destroyed once no frame in flight uses them) instead of being destroyed at once
+    void DestroyTargets(std::vector<vk::Image>* retire = nullptr);
+    void RecordTargetClears(VkCommandBuffer cmd, VkExtent2D extent);
+    void WriteImageDescriptors(uint32_t slot_mask = ~0u);  // the frame slots in the mask
     bool CreateTarget(RenderTarget& target, VkFormat format, VkExtent2D extent, VkImageUsageFlags usage, VkImageAspectFlags aspect);
     bool UploadImage(vk::Image& image, VkFormat format, VkExtent3D extent, const void* data, size_t size);
     bool UploadImageMips(vk::Image& image, VkFormat format, VkExtent3D extent, const std::vector<std::vector<uint8_t>>& mips);
@@ -685,6 +687,13 @@ private:
     glm::mat4 previous_view_projection_{1.0f};
     double frame_time_ = 1.0 / 60.0;
     uint32_t frame_counter_ = 0;
+    // render size changes without a GPU wait (EnsureTargets): replaced images by the frame they were retired in, the frame slots whose
+    // descriptor sets still name the old images, and the subsurface targets (made again when that pass next runs)
+    std::vector<std::pair<uint32_t, std::vector<vk::Image>>> retired_images_;
+    uint32_t descriptor_dirty_slots_ = 0;
+    bool sss_stale_ = false;
+    uint32_t sss_last_frame_ = 0;
+    bool sss_used_ = false;
     RenderStats stats_;
 
     struct UpscaleState {
