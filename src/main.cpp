@@ -114,7 +114,13 @@ extern "C" void pt_switch_release_cpu_clock();
 // GPU clock control: see ReadSwitchClockConfig
 struct SwitchClockConfig {
     unsigned gpu_mhz = 0;
+#ifdef __SWITCH2__
+    // the automatic clock's GPU ceiling: the Switch 2's own docked GPU rate (handheld runs 561 MHz), so no overclock by default; the system
+    // allows up to 1389 MHz (max_mhz in switch.ini)
+    unsigned max_mhz = 1007;
+#else
     unsigned max_mhz = 1152;  // the automatic clock's GPU ceiling: what the port was tuned at (clock managers clamp it to what they allow)
+#endif
     unsigned cpu_max_mhz = 1785;  // the automatic clock's CPU ceiling (1785: the console's own boost rate, no overclock needed)
     bool automatic = true;    // new players get the automatic clock; switch.ini keeps their choice afterwards
     unsigned applied_mhz = 0;  // the clock we last set: held (re-applied when the system changes it)
@@ -157,12 +163,40 @@ constexpr int kSwitchStartLevel = 4;  // 960x540
 constexpr bool kSwitchLock30Default = true;
 #endif
 constexpr int kSwitchLevels = static_cast<int>(sizeof(kSwitchSizes) / sizeof(kSwitchSizes[0]));
-// the largest scene size the screen holds (Switch 2: it changes with docking); on the Switch the list starts at the handheld screen's size
+#if defined(__SWITCH2__) && defined(PT_WITH_FSR2)
+#define PT_SWITCH_FSR2 1
+#endif
+bool SwitchFsr2Active();
+// FSR 2's output on the Switch 2: the screen's size, at most 1920x1080 (a 4K TV gets 1080p, scaled up by the final pass like before)
+VkExtent2D SwitchOutputSize() {
+    int w = 1920;
+    int h = 1080;
+    SDL_GetWindowSizeInPixels(nullptr, &w, &h);
+    w = std::max(w, 2);
+    h = std::max(h, 2);
+    if (w > 1920 || h > 1080) {
+        if (static_cast<int64_t>(w) * 1080 >= static_cast<int64_t>(h) * 1920) {
+            h = static_cast<int>(static_cast<int64_t>(h) * 1920 / w) & ~1;
+            w = 1920;
+        } else {
+            w = static_cast<int>(static_cast<int64_t>(w) * 1080 / h) & ~1;
+            h = 1080;
+        }
+    }
+    return {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
+}
+// the largest scene size the screen holds (Switch 2: it changes with docking; with FSR 2 the size it upscales to); on the Switch the list
+// starts at the handheld screen's size
 int SwitchTopLevel() {
 #ifdef __SWITCH2__
     int w = 0;
     int h = 0;
     SDL_GetWindowSizeInPixels(nullptr, &w, &h);
+    if (SwitchFsr2Active()) {
+        const VkExtent2D out = SwitchOutputSize();
+        w = static_cast<int>(out.width);
+        h = static_cast<int>(out.height);
+    }
     for (int i = 0; i < kSwitchLevels; ++i) {
         if (static_cast<int>(kSwitchSizes[i].width) <= w && static_cast<int>(kSwitchSizes[i].height) <= h) return i;
     }
@@ -170,6 +204,16 @@ int SwitchTopLevel() {
 #else
     return 0;
 #endif
+}
+// the smallest scene size: with FSR 2, a third of the output's width (its Ultra Performance ratio; below that it has too little to work with)
+int SwitchBottomLevel() {
+    if (SwitchFsr2Active()) {
+        const uint32_t min_width = (SwitchOutputSize().width + 2) / 3;
+        for (int i = kSwitchLevels - 1; i >= 0; --i) {
+            if (kSwitchSizes[i].width >= min_width) return std::max(i, SwitchTopLevel());
+        }
+    }
+    return kSwitchLevels - 1;
 }
 struct SwitchGfx {
     bool dynamic = true;       // dynamic resolution: the scene render size follows the measured GPU time
@@ -182,8 +226,21 @@ struct SwitchGfx {
     int aa = 3;                // anti-aliasing: 0 off, 1 FXAA, 2 SMAA 1x, 3 TAA (default); the Minus menu sets it, switch.ini keeps it
     int shadow_tile = 1024;    // shadow map size per light in pixels (512, 1024, 1536, 2048): the Minus menu sets it, switch.ini keeps it
     float target_ms = 30.0f;   // scene GPU budget per frame: 33.3 ms minus the composite/UI (measured ~1.1 ms: whole-frame minus scene GPU) minus margin
+#ifdef PT_SWITCH_FSR2
+    bool fsr2 = true;          // Switch 2: FSR 2 upscales the scene (the dynamic size) to the screen, 1080p at most; it is the anti-aliasing too
+    float fsr2_sharpness = 0.0f;  // FSR 2's own sharpening (RCAS): an extra pass at the output size (~1 ms at 561 MHz), off by default (the
+                                  // final screen pass's clarity sharpens already)
+#endif
 };
 SwitchGfx g_switch_gfx;
+// FSR 2 runs when it is built in and chosen, and not with LSFG frame generation (that path keeps the scene at a fixed size of its own)
+bool SwitchFsr2Active() {
+#ifdef PT_SWITCH_FSR2
+    return g_switch_gfx.fsr2 && !g_switch_gfx.frame_gen;
+#else
+    return false;
+#endif
+}
 struct FrameAcc {
     unsigned frames = 0;
     float interval = 0.0f, interval_max = 0.0f, fence = 0.0f, acquire = 0.0f, present = 0.0f, gpu = 0.0f, gpu_max = 0.0f;
@@ -1313,13 +1370,53 @@ void SaveSwitchConfig() {
     out << "max_mhz=" << g_clock_config.max_mhz << "\n";
     out << "cpu_max_mhz=" << g_clock_config.cpu_max_mhz << "\n";
     out << "auto=" << (g_clock_config.automatic ? 1 : 0) << "\n";
+#ifdef PT_SWITCH_FSR2
+    out << "fsr2=" << (g_switch_gfx.fsr2 ? 1 : 0) << "\n";
+    out << "fsr2_sharpness=" << g_switch_gfx.fsr2_sharpness << "\n";
+#endif
+}
+
+// The scene's render size. Without FSR 2 the renderer's size is the scene's, and the final pass scales it to the screen. With FSR 2 the
+// renderer works at the output size (the screen's, 1080p at most: post-processing, the UI) and the scene renders at `size`, which FSR 2
+// upscales to it. Called whenever the size, the output size (docking) or the FSR 2 choice changes.
+void ApplySwitchSceneSize(App& app, VkExtent2D size) {
+    if (SwitchFsr2Active()) {
+        const VkExtent2D out = SwitchOutputSize();
+        app.renderer.SetRenderExtent(out);
+        app.scene.upscale.kind = pt::UpscalerKind::Fsr;
+        app.scene.upscale.frame_generation = pt::FrameGenKind::Off;
+#ifdef PT_SWITCH_FSR2
+        app.scene.upscale.sharpness = g_switch_gfx.fsr2_sharpness;
+#endif
+        app.scene.upscale_render_size = {std::min(size.width, out.width), std::min(size.height, out.height)};
+        // FSR 2 after the post-processing: everything but FSR 2 and the final screen pass stays at the render size, with the Switch's
+        // half-resolution lights and quarter-resolution probes
+        app.scene.upscale_after_post = true;
+    } else {
+        app.scene.upscale_after_post = false;
+        app.scene.upscale.kind = pt::UpscalerKind::Off;
+        app.scene.upscale_render_size = {0, 0};
+        app.renderer.SetRenderExtent(size);
+    }
+}
+
+// the scene's render size as it is now (with FSR 2 that is smaller than the renderer's size)
+VkExtent2D SwitchSceneSize(App& app) {
+    const pt::UpscaleStats& up = app.scene.UpscaleStatistics();
+    return up.active ? up.render : app.renderer.RenderExtent();
 }
 
 // fps, the scene render size and the scene GPU time in the top left corner (drawn at the screen's size, over everything)
 void DrawSwitchOverlay(App& app) {
-    const VkExtent2D render = app.renderer.RenderExtent();
-    char text[96];
-    std::snprintf(text, sizeof(text), "%.0f fps   %ux%u   gpu %.1f ms", ImGui::GetIO().Framerate, render.width, render.height, app.scene.Stats().gpu_ms);
+    const VkExtent2D render = SwitchSceneSize(app);
+    const pt::UpscaleStats& up = app.scene.UpscaleStatistics();
+    char text[128];
+    if (up.active) {
+        std::snprintf(text, sizeof(text), "%.0f fps   %ux%u -> %ux%u FSR 2   gpu %.1f ms", ImGui::GetIO().Framerate, render.width, render.height,
+                      up.output.width, up.output.height, app.scene.Stats().gpu_ms);
+    } else {
+        std::snprintf(text, sizeof(text), "%.0f fps   %ux%u   gpu %.1f ms", ImGui::GetIO().Framerate, render.width, render.height, app.scene.Stats().gpu_ms);
+    }
     const ImVec2 size = ImGui::CalcTextSize(text);
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     draw->AddRectFilled(ImVec2(6.0f, 4.0f), ImVec2(14.0f + size.x, 10.0f + size.y), IM_COL32(0, 0, 0, 150), 4.0f);
@@ -1363,10 +1460,16 @@ void ApplyFrameGen(App& app, bool on) {
 void DrawSwitchSection(App& app) {
     if (!ImGui::CollapsingHeader("Switch: performance and debug", ImGuiTreeNodeFlags_DefaultOpen)) return;
     const pt::RenderStats& st = app.scene.Stats();
-    const VkExtent2D render = app.renderer.RenderExtent();
+    const VkExtent2D render = SwitchSceneSize(app);
     unsigned cpu_hz = 0, gpu_hz = 0;
     const bool have_clocks = pt_switch_clocks(&cpu_hz, &gpu_hz);
     ImGui::Text("%.1f fps   scene gpu %.1f ms   cpu %.1f ms   %ux%u", ImGui::GetIO().Framerate, st.gpu_ms, st.cpu_ms, render.width, render.height);
+    if (const pt::UpscaleStats& up = app.scene.UpscaleStatistics(); up.active) {
+        ImGui::Text("FSR 2: %ux%u -> %ux%u, inputs %.2f ms, FSR 2 + final pass %.2f ms", up.render.width, up.render.height, up.output.width,
+                    up.output.height, up.inputs_ms, up.upscale_ms);
+    } else if (!up.error.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "FSR 2 unavailable: %s", up.error.c_str());
+    }
     if (have_clocks) ImGui::Text("clocks: cpu %u MHz, gpu %u MHz", cpu_hz / 1000000u, gpu_hz / 1000000u);
     ImGui::Text("passes ms: shadows %.1f  gbuffer %.1f  lighting %.1f  compose %.1f  post %.1f", st.pass_ms[0], st.pass_ms[2], st.pass_ms[3], st.pass_ms[4], st.pass_ms[5]);
     ImGui::Text("%u lights, %u probes, %u shadow views", st.lights, st.probes, st.shadow_views);
@@ -1389,10 +1492,11 @@ void DrawSwitchSection(App& app) {
     char current[48];
     std::snprintf(current, sizeof(current), "%ux%u", kSwitchSizes[g_switch_gfx.level].width, kSwitchSizes[g_switch_gfx.level].height);
     if (ImGui::BeginCombo(g_switch_gfx.dynamic ? "Start size" : "Scene render size", current)) {
-        for (int i = SwitchTopLevel(); i < kSwitchLevels; ++i) {
+        for (int i = SwitchTopLevel(); i <= SwitchBottomLevel(); ++i) {
             char label[48];
 #ifdef __SWITCH2__
-            std::snprintf(label, sizeof(label), "%ux%u%s", kSwitchSizes[i].width, kSwitchSizes[i].height, i == SwitchTopLevel() ? "  (screen)" : "");
+            std::snprintf(label, sizeof(label), "%ux%u%s", kSwitchSizes[i].width, kSwitchSizes[i].height,
+                          i == SwitchTopLevel() ? (SwitchFsr2Active() ? "  (output: FSR 2 as anti-aliasing)" : "  (screen)") : "");
 #else
             std::snprintf(label, sizeof(label), "%ux%u%s", kSwitchSizes[i].width, kSwitchSizes[i].height, i == 0 ? "  (screen, handheld)" : "");
 #endif
@@ -1400,6 +1504,19 @@ void DrawSwitchSection(App& app) {
         }
         ImGui::EndCombo();
     }
+#ifdef PT_SWITCH_FSR2
+    ImGui::BeginDisabled(g_switch_gfx.frame_gen);
+    ImGui::Checkbox("FSR 2 upscaling (to the screen, 1080p at most)", &g_switch_gfx.fsr2);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip(g_switch_gfx.frame_gen ? "Not with frame generation (it keeps the scene at a fixed size of its own)."
+                                                  : "AMD FSR 2 rebuilds the screen's resolution from the smaller scene size over several frames.\n"
+                                                    "It replaces the anti-aliasing below. Off: the scene is scaled to the screen by the final pass.");
+    }
+    ImGui::BeginDisabled(!SwitchFsr2Active());
+    ImGui::SliderFloat("FSR 2 sharpening", &g_switch_gfx.fsr2_sharpness, 0.0f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
+#endif
 
     ImGui::SeparatorText("Frame generation");
     {
@@ -1515,6 +1632,7 @@ void DrawSwitchSection(App& app) {
             ImGui::EndCombo();
         }
         ImGui::TextDisabled("TAA blends the last frames (jittered), SMAA and FXAA smooth edges in one frame. Save to keep it.");
+        if (SwitchFsr2Active()) ImGui::TextDisabled("FSR 2 is on: it does the anti-aliasing, this choice applies with FSR 2 off.");
     }
     ImGui::SeparatorText("Shadows");
     {
@@ -4831,7 +4949,9 @@ int RunGame(App& app, pt::Vfs& vfs) {
                     // (a clock manager holds an override itself: nothing to re-assert, and fewer clock requests)
                     if (g_clock_config.applied_mhz > 0 && !pt_switch_has_clock_manager() && ++hold_tick % 30 == 0) {
                         unsigned cpu_hz = 0, gpu_hz = 0;
-                        if (pt_switch_clocks(&cpu_hz, &gpu_hz) && gpu_hz / 1000000u != g_clock_config.applied_mhz) {
+                        // within 2%: a rate from a range (the Switch 2) can come back a few MHz off the one asked for
+                        const auto off = [&] { return std::abs(static_cast<int>(gpu_hz / 1000000u) - static_cast<int>(g_clock_config.applied_mhz)); };
+                        if (pt_switch_clocks(&cpu_hz, &gpu_hz) && off() * 50 > static_cast<int>(g_clock_config.applied_mhz)) {
                             const unsigned now = pt_switch_set_gpu_mhz(g_clock_config.applied_mhz);
                             if (++reasserted <= 12 || reasserted % 60 == 0) {
                                 pt::LogInfo("clocks: the gpu was {} MHz, set back to {} MHz (now {}), {} times", gpu_hz / 1000000u,
@@ -5170,10 +5290,26 @@ int RunGame(App& app, pt::Vfs& vfs) {
                     g_switch_gfx.dynamic = false;
                     g_switch_gfx.level = levels[current];
                 }
-                g_switch_gfx.level = std::clamp(g_switch_gfx.level, SwitchTopLevel(), kSwitchLevels - 1);
+                g_switch_gfx.level = std::clamp(g_switch_gfx.level, SwitchTopLevel(), SwitchBottomLevel());
+                // FSR 2 switched on or off in the menu, or a new output size (docked/undocked): the sizes are set again
+                static bool applied_fsr2 = SwitchFsr2Active();
+                static VkExtent2D applied_output = SwitchOutputSize();
+                const bool fsr2_now = SwitchFsr2Active();
+                const VkExtent2D output_now = SwitchOutputSize();
+                if (fsr2_now != applied_fsr2 || (fsr2_now && (output_now.width != applied_output.width || output_now.height != applied_output.height))) {
+                    applied_fsr2 = fsr2_now;
+                    applied_output = output_now;
+                    applied_level = -1;
+                    if (pinned) ApplySwitchSceneSize(app, {g_clock_config.pinned_w, g_clock_config.pinned_h});
+                    pt::LogInfo("switch: FSR 2 {}, output {}x{}", fsr2_now ? "on" : "off", output_now.width, output_now.height);
+                }
+#ifdef PT_SWITCH_FSR2
+                if (fsr2_now) app.scene.upscale.sharpness = g_switch_gfx.fsr2_sharpness;
+#endif
                 if (!pinned && applied_level != g_switch_gfx.level) {
-                    app.renderer.SetRenderExtent(kSwitchSizes[g_switch_gfx.level]);
-                    pt::LogInfo("switch: scene render size {}x{}", kSwitchSizes[g_switch_gfx.level].width, kSwitchSizes[g_switch_gfx.level].height);
+                    ApplySwitchSceneSize(app, kSwitchSizes[g_switch_gfx.level]);
+                    pt::LogInfo("switch: scene render size {}x{}{}", kSwitchSizes[g_switch_gfx.level].width, kSwitchSizes[g_switch_gfx.level].height,
+                                fsr2_now ? std::format(", FSR 2 to {}x{}", output_now.width, output_now.height) : std::string());
                     applied_level = g_switch_gfx.level;
                     settle = 12;
                     hist_count = frames_at_level = 0;
@@ -5270,7 +5406,10 @@ int RunGame(App& app, pt::Vfs& vfs) {
                         return v;
                     };
                     auto pixels = [](int i) { return static_cast<double>(kSwitchSizes[i].width) * kSwitchSizes[i].height; };
-                    const double fixed = std::min(gpu * 0.5, static_cast<double>(st.pass_ms[0]) + 1.8);  // shadows and per-pass overheads
+                    // the part of the scene GPU time that does not follow the render size: shadows and per-pass overheads; with FSR 2 also FSR 2
+                    // itself and the final screen pass, which run at the output size (the upscale timestamps around them)
+                    const double at_output = SwitchFsr2Active() ? static_cast<double>(app.scene.UpscaleStatistics().upscale_ms) : 0.0;
+                    const double fixed = std::min(gpu * (at_output > 0.0 ? 0.8 : 0.5), static_cast<double>(st.pass_ms[0]) + 1.8 + at_output);
                     auto predict = [&](double cost, int from, int to) { return fixed + std::max(0.0, cost - fixed) * pixels(to) / pixels(from); };
                     const int level = g_switch_gfx.level;
                     int target = level;
@@ -5294,10 +5433,10 @@ int RunGame(App& app, pt::Vfs& vfs) {
                                        v[5] * rates[clock_index] / rates[clock_target] > budget * 0.85) {
                                     ++clock_target;
                                 }
-                            } else if (level + 1 < kSwitchLevels) {
+                            } else if (level + 1 <= SwitchBottomLevel()) {
                                 const double cost = v[5];
                                 target = level + 1;
-                                while (target + 1 < kSwitchLevels && predict(cost, level, target) > budget * 0.92) ++target;
+                                while (target + 1 <= SwitchBottomLevel() && predict(cost, level, target) > budget * 0.92) ++target;
                                 blocked_until[level] = now_s + 10.0;
                             }
                         }
@@ -5365,6 +5504,16 @@ int RunGame(App& app, pt::Vfs& vfs) {
                                                                          cpu_hz / 1000000u, gpu_hz / 1000000u, pt_switch_mem_hz() / 1000000u,
                                                                          g_switch_slow_frames, g_switch_gfx.lock30);
                     g_switch_slow_frames = 0;
+                    if (const pt::UpscaleStats& up = app.scene.UpscaleStatistics(); up.active) {
+                        const pt::RenderStats& rs = app.scene.Stats();
+                        pt::LogInfo("fsr2: {}x{} -> {}x{} | inputs {:.2f} ms, FSR 2 and the final pass {:.2f} ms | scene gpu {:.2f}: shadows {:.2f} "
+                                    "gbuffer {:.2f} lighting {:.2f} (probes {:.2f} lights {:.2f} resolve {:.2f}) compose {:.2f} post {:.2f}",
+                                    up.render.width, up.render.height, up.output.width, up.output.height, up.inputs_ms, up.upscale_ms, rs.gpu_ms,
+                                    rs.pass_ms[0], rs.pass_ms[2], rs.pass_ms[3], rs.light_ms[1], rs.light_ms[2], rs.light_ms[3], rs.pass_ms[4],
+                                    rs.pass_ms[5]);
+                    } else if (SwitchFsr2Active() && !up.error.empty()) {
+                        pt::LogWarn("fsr2: not active: {}", up.error);
+                    }
                     pt::vk::SavePipelineCacheAsync(app.renderer.Context().device);  // only when new pipelines were built (in the background)
                     if (g_frame_acc.frames > 0) {
                         const float n = static_cast<float>(g_frame_acc.frames);
@@ -5646,6 +5795,10 @@ void ReadSwitchClockConfig(int& argc, char** argv) {
             else if (key == "fidelity") g_switch_gfx.fidelity = value != 0;
             else if (key == "frame_gen") g_switch_gfx.frame_gen = value != 0;
             else if (key == "lsfg_flow") g_switch_gfx.lsfg_flow = std::clamp(std::strtof(line.c_str() + eq + 1, nullptr), 1.0f, 4.0f);
+#ifdef PT_SWITCH_FSR2
+            else if (key == "fsr2") g_switch_gfx.fsr2 = value != 0;
+            else if (key == "fsr2_sharpness") g_switch_gfx.fsr2_sharpness = std::clamp(std::strtof(line.c_str() + eq + 1, nullptr), 0.0f, 1.0f);
+#endif
             else if (key == "size" || key == "level") {
                 // size=WxH; the old level=N indexed the earlier 7-size list
                 static constexpr unsigned kOldWidths[] = {1280, 960, 800, 704, 608, 512, 448};
@@ -5813,6 +5966,9 @@ int main(int argc, char** argv) {
         g_switch_gfx.level = 0;
     }
     if (const char* overlay = std::getenv("PT_OVERLAY")) g_switch_gfx.overlay = std::atoi(overlay) != 0;
+#ifdef PT_SWITCH_FSR2
+    if (const char* fsr2 = std::getenv("PT_FSR2")) g_switch_gfx.fsr2 = std::atoi(fsr2) != 0;  // test override of switch.ini (A/B runs)
+#endif
 #endif
 #ifdef _WIN32
     const HANDLE inherited = GetStdHandle(STD_ERROR_HANDLE);
@@ -6183,14 +6339,16 @@ int main(int argc, char** argv) {
         // the Tegra X1 cannot shade the scene at 720p/1080p at a playable rate: the scene is rendered smaller and scaled to the screen by the final pass
         {
             const bool pinned = g_clock_config.pinned_w > 0 && g_clock_config.pinned_h > 0;
-            g_switch_gfx.level = std::clamp(g_switch_gfx.level, SwitchTopLevel(), kSwitchLevels - 1);
+            g_switch_gfx.level = std::clamp(g_switch_gfx.level, SwitchTopLevel(), SwitchBottomLevel());
 #ifdef __SWITCH2__
             app.renderer.on_late_frame = [&app](uint32_t frame_index) { app.scene.LogGpuProgress(frame_index); };
 #endif
             const uint32_t w = pinned ? g_clock_config.pinned_w : kSwitchSizes[g_switch_gfx.level].width;
             const uint32_t h = pinned ? g_clock_config.pinned_h : kSwitchSizes[g_switch_gfx.level].height;
-            app.renderer.SetRenderExtent({w, h});
-            pt::LogInfo("switch: scene render size {}x{}{}", w, h, pinned ? " (pinned)" : "");
+            ApplySwitchSceneSize(app, {w, h});
+            const VkExtent2D out = SwitchOutputSize();
+            pt::LogInfo("switch: scene render size {}x{}{}{}", w, h, pinned ? " (pinned)" : "",
+                        SwitchFsr2Active() ? std::format(", FSR 2 to {}x{}", out.width, out.height) : std::string());
         }
 #endif
         const bool viewer = !options.stage.empty() || !options.texture_test.empty();

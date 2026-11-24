@@ -181,8 +181,41 @@ On the Switch 2 the screen is 1920x1080 handheld and, docked, the system's outpu
 follows the TV and the console's TV resolution setting; 1080p if it cannot be read). Docking or undocking while playing rebuilds the
 swapchain at the new size. The scene starts at the screen's size (sizes up to 3840x2160) and dynamic resolution steps it down only when a
 frame misses the budget; the 30 fps lock is off by default (60 fps; a `switch.ini` saved with `lock30=1` keeps the lock). The GPU timer is
-measured against the CPU clock at start-up instead of the Tegra X1 correction. The clock control and performance numbers above are the
-Switch 1's.
+measured against the CPU clock at start-up instead of the Tegra X1 correction. The performance numbers above are the Switch 1's.
+
+**GPU clock (Switch 2).** clkrst reports the Switch 2's GPU rates as a range (306-1389 MHz) where the Switch reports a list, and the
+automatic clock read only lists, so it was off: every frame ran at the handheld 561 MHz. With `PT_GPU_RANGE_CLOCK=1` (a test setting,
+off by default) a range becomes a ladder of rates in it that includes 561 (handheld) and 1007 MHz (docked), and the automatic clock raises
+the GPU when frames miss the budget, before the dynamic resolution steps down. **It is off by default because the first build that did this
+froze the console in the opening scene, and the homebrew menu would not start from HOME again until a reboot** (cause not yet known from
+the log). Without it the Switch 2's clock is not touched. Its default ceiling on the Switch 2 is 1007 MHz, the console's own docked rate (`max_mhz=` in `switch.ini` up to
+1389; a `switch.ini` saved by an earlier build holds the Switch's 1152). The log shows each request and the rate read back. The Switch 2
+offers no CPU or memory rate list (the CPU runs 1100 MHz, the memory 2133 MHz).
+
+**FSR 2 (Switch 2).** The console's DLSS is not reachable from homebrew (it ships inside each game through Nintendo's SDK and NVN, and
+ouncevk is Mesa's open NVK driver), so the Switch 2 build upscales with AMD FidelityFX Super Resolution 2.2.1, compiled from source
+(`switch/CMakeLists.txt`, target `pt_fsr2`; `-DPT_FSR2=OFF` leaves it out). With it on (the default, Minus menu "FSR 2 upscaling",
+`fsr2=` in `switch.ini`, `PT_FSR2=0/1` for A/B runs) the renderer works at the output size, the screen's size capped at 1920x1080 (a 4K
+TV gets 1080p, scaled by the final pass), and the scene renders at the dynamic resolution's size, which FSR 2 upscales to it every frame.
+FSR 2 runs **after** the post-processing (`SceneRenderer::upscale_after_post`): the scene and every post-processing pass stay at the render
+size, FSR 2 takes the tonemapped image (its non-HDR mode), and only FSR 2 and the final screen pass (distortion, clarity, dither,
+screen-layer effects) run at the output size. The first version ran FSR 2 before the post-processing, the desktop upscalers' order, and that
+path also turns off the half-resolution lights and quarter-resolution probes and adds temporal reflection, mirror and flashlight passes: the
+same view fell from 60 fps at 736x414 without FSR 2 to 31 fps at 640x360 with it. This mode keeps the half-resolution lighting, leaves
+those passes out, and uses half of FSR 2's negative texture LOD bias (the full one fetches textures as at 1080p).
+The dynamic resolution steps between the output size (FSR 2 as anti-aliasing only) and a third of its width (FSR 2's Ultra Performance
+ratio), with the same 14 ms scene budget for 60 fps; FSR 2 and the final pass count as a fixed cost in its model. A size change keeps the FSR 2 context (it is created for every render size up to the output) and does not wait for the GPU.
+FSR 2 replaces the TAA/SMAA/FXAA choice while it is on; "FSR 2 sharpening" (`fsr2_sharpness=`, default 0: it is one more pass at the output
+size, and the final pass's clarity sharpens already) is its RCAS pass. Measured handheld at 561 MHz (before the clock fix): FSR 2 and the
+final pass at 1080p 9.1 ms, the rest of the scene at 640x360 about 10 ms, 45-48 fps. It is off
+with LSFG frame generation, which keeps its own fixed size. The log prints the split every 10 s (`fsr2: <render> -> <output> | inputs, FSR 2
+and the final pass | scene gpu and its passes`).
+
+FSR 2's Vulkan shaders are normally made by AMD's `FidelityFX_SC.exe` (Windows only); `tools/fsr2_vk_shaders.py` compiles them with glslc
+into the same permutation headers, for the permutations the engine creates (render-size motion vectors without jitter, reversed-Z
+infinite depth; HDR colour, the Lanczos LUT and sharpening both ways; 32-bit only, the 16-bit key maps to the 32-bit shaders).
+`src/platform/switch/fsr2/ffx_compat.h` supplies the MSVC helpers its runtime uses. Not measured on the console yet: FSR 2's own cost at
+1080p and the output-size post-processing decide how small the scene has to get for 60 fps.
 
 ## Known gaps
 

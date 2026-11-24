@@ -766,27 +766,36 @@ void SceneRenderer::DestroyTargets(std::vector<vk::Image>* retire) {
     mirror_history_valid_ = false;
     mirror_history_size_ = 0;
     reflect_history_valid_ = false;
-    DestroyUpscaleTargets();
+    DestroyUpscaleTargets(retire);
     extent_ = {0, 0};
     output_extent_ = {0, 0};
+    display_extent_ = {0, 0};
 }
 
-bool SceneRenderer::EnsureTargets(VkExtent2D extent, VkExtent2D output, bool upscaling) {
+bool SceneRenderer::EnsureTargets(VkExtent2D extent, VkExtent2D output, bool upscaling, VkExtent2D display) {
     if (extent.width == 0 || extent.height == 0 || output.width == 0 || output.height == 0) {
         return false;
     }
+    if (display.width == 0 || display.height == 0) {
+        display = output;
+    }
+    // upscaling after the post-processing: its targets stay at the scene's size, only the upscaler's output is at the display size
+    const bool late = upscaling && upscale_after_post;
     if (extent.width == extent_.width && extent.height == extent_.height && output.width == output_extent_.width &&
-        output.height == output_extent_.height && upscaling == targets_upscaled_) {
+        output.height == output_extent_.height && display.width == display_extent_.width && display.height == display_extent_.height &&
+        upscaling == targets_upscaled_ && late == targets_late_) {
         return true;
     }
     // A size change while playing (dynamic resolution) does not wait for the GPU: that wait plus the re-creation was a 40-50 ms frame each
     // time the scene got heavier (doors opening). The old images are kept until the frame still in flight is done, the new ones are cleared
-    // in this frame's command buffer, and only this frame slot's descriptor sets are written now. The first creation, upscaling and the
-    // subsurface pass (the ending) keep the waiting path.
+    // in this frame's command buffer, and only this frame slot's descriptor sets are written now. The first creation, turning upscaling on
+    // or off, a new output size and the subsurface pass (the ending) keep the waiting path; a new render size under the same upscaler and
+    // output (the Switch 2's dynamic resolution with FSR 2) does not wait either.
     const auto resize_start = std::chrono::steady_clock::now();
     const bool sss_recent = sss_used_ && frame_counter_ < sss_last_frame_ + Renderer::kFramesInFlight + 2;
-    const bool no_wait = extent_.width > 0 && !upscaling && !targets_upscaled_ && !sss_recent && !renderer_->frame_generation &&
-                         renderer_->Cmd() != VK_NULL_HANDLE;
+    const bool same_upscale = upscaling == targets_upscaled_ &&
+                              (!upscaling || (display.width == display_extent_.width && display.height == display_extent_.height && late == targets_late_));
+    const bool no_wait = extent_.width > 0 && same_upscale && !sss_recent && !renderer_->frame_generation && renderer_->Cmd() != VK_NULL_HANDLE;
     if (no_wait) {
         retired_images_.emplace_back(frame_counter_, std::vector<vk::Image>{});
         DestroyTargets(&retired_images_.back().second);
@@ -839,8 +848,9 @@ bool SceneRenderer::EnsureTargets(VkExtent2D extent, VkExtent2D output, bool ups
     }
     ok = ok && CreateTarget(mb_neighbour_, kPostFormat, mb_tile_[4].Extent(), color, c) &&
          CreateTarget(mb_bake_, kPostFormat, {(output.width + 1) >> 1, (output.height + 1) >> 1}, color, c);
-    ok = ok && (!upscaling || CreateUpscaleTargets(extent, output));
-    ok = ok && (!upscaling ||
+    ok = ok && (!upscaling || CreateUpscaleTargets(extent, display, !late));
+    // the desktop upscaler path's temporal mirror and reflection targets (not used after the post-processing)
+    ok = ok && (!upscaling || late ||
                 (CreateTarget(mirror_history_, kHdrFormat, extent, color | VK_IMAGE_USAGE_TRANSFER_DST_BIT, c) &&
                  CreateTarget(mirror_temporal_, kHdrFormat, extent, color | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, c) &&
                  CreateTarget(reflect_layer_, kHdrFormat, extent, color, c) && CreateTarget(reflect_offset_, kHdrFormat, extent, color, c) &&
@@ -860,7 +870,9 @@ bool SceneRenderer::EnsureTargets(VkExtent2D extent, VkExtent2D output, bool ups
     }
     extent_ = extent;
     output_extent_ = output;
+    display_extent_ = display;
     targets_upscaled_ = upscaling;
+    targets_late_ = late;
     history_valid_ = false;
     if (no_wait) {
         const uint32_t current = 1u << renderer_->FrameIndex();

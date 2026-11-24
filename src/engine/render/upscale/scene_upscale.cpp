@@ -139,7 +139,7 @@ void SceneRenderer::DestroyUpscalePipelines() {
     }
 }
 
-bool SceneRenderer::CreateUpscaleTargets(VkExtent2D render, VkExtent2D output) {
+bool SceneRenderer::CreateUpscaleTargets(VkExtent2D render, VkExtent2D output, bool post_targets) {
     const VkImageUsageFlags color = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     const VkImageAspectFlags c = VK_IMAGE_ASPECT_COLOR_BIT;
     const bool ok = CreateTarget(motion_, kMotionFormat, render, color | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, c) && CreateTarget(reactive_, kReactiveFormat, render, color | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, c) &&
@@ -148,22 +148,30 @@ bool SceneRenderer::CreateUpscaleTargets(VkExtent2D render, VkExtent2D output) {
                     CreateTarget(exposure_image_, kExposureFormat, {1, 1}, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, c) &&
                     CreateTarget(upscaled_, kUpscaleColorFormat, output,
                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, c) &&
-                    CreateTarget(post_hdr_, kUpscaleColorFormat, output, color, c) && CreateTarget(post_depth_, kPostDepthFormat, output, color, c) &&
-                    CreateTarget(post_object_velocity_, kUpscaleColorFormat, output, color, c);
+                    // the post-processing's inputs at the output size (not needed when it runs before the upscaler, upscale_after_post)
+                    (!post_targets ||
+                     (CreateTarget(post_hdr_, kUpscaleColorFormat, output, color, c) && CreateTarget(post_depth_, kPostDepthFormat, output, color, c) &&
+                      CreateTarget(post_object_velocity_, kUpscaleColorFormat, output, color, c)));
     if (!ok) {
         LogError("scene renderer: cannot create upscale targets {}x{} -> {}x{}", render.width, render.height, output.width, output.height);
     }
     return ok;
 }
 
-void SceneRenderer::DestroyUpscaleTargets() {
+void SceneRenderer::DestroyUpscaleTargets(std::vector<vk::Image>* retire) {
     vk::Context& ctx = renderer_->Context();
     RenderTarget* targets[] = {&motion_, &reactive_, &opaque_, &handy_factor_, &exposure_image_, &upscaled_, &post_hdr_, &post_depth_, &post_object_velocity_};
     for (RenderTarget* t : targets) {
-        ctx.DestroyImage(t->image);
+        // retire: kept until the frame still in flight is done (a size change without a GPU wait, EnsureTargets)
+        if (retire && t->image.image) {
+            retire->push_back(t->image);
+        } else {
+            ctx.DestroyImage(t->image);
+        }
         *t = RenderTarget{};
     }
     targets_upscaled_ = false;
+    targets_late_ = false;
 }
 
 void SceneRenderer::WriteUpscaleDescriptors(VkDescriptorImageInfo* images, bool post) {
@@ -248,16 +256,26 @@ bool SceneRenderer::SetupUpscaler(VkExtent2D output) {
         upscale_stats_.error = reason;
         return false;
     }
-    const VkExtent2D render = UpscaleRenderExtent(output, upscale.quality, upscale.scale);
+    // upscale_render_size: an exact render size (the Switch 2's dynamic resolution steps), else the quality mode's ratio
+    const bool exact = upscale_render_size.width > 0 && upscale_render_size.height > 0;
+    const VkExtent2D render = exact ? VkExtent2D{std::min(upscale_render_size.width, output.width), std::min(upscale_render_size.height, output.height)}
+                                    : UpscaleRenderExtent(output, upscale.quality, upscale.scale);
     UpscaleSettings key_settings = upscale;
     key_settings.sharpness = 0.0f;
     key_settings.frame_generation = FrameGenKind::Off;
     if (kind != UpscalerKind::Dlss) {
         key_settings.dlss_model = DlssModel::Auto;
     }
-    const bool changed = !up_.created || up_.kind != kind || !(up_.created_settings == key_settings) || up_.created_render.width != render.width ||
-                         up_.created_render.height != render.height || up_.created_output.width != output.width ||
-                         up_.created_output.height != output.height;
+    if (exact) {
+        key_settings.quality = UpscaleQuality::Custom;  // the size comes from upscale_render_size, not the quality mode
+        key_settings.scale = 1.0f;
+    }
+    // a backend with dynamic resolution keeps its context when only the render size changes (it was created for any size up to the output)
+    const bool dynamic = up_.created && up_.kind == kind && up_.backend && up_.backend->DynamicResolution();
+    const bool hdr = !upscale_after_post;  // after the post-processing the upscaler takes the tonemapped image
+    const bool changed = !up_.created || up_.kind != kind || !(up_.created_settings == key_settings) || up_.created_hdr != hdr ||
+                         (!dynamic && (up_.created_render.width != render.width || up_.created_render.height != render.height)) ||
+                         up_.created_output.width != output.width || up_.created_output.height != output.height;
     if (changed) {
         const std::string failed_key = std::format("{}|{}|{}x{}|{}x{}", UpscalerKey(kind), UpscaleQualityKey(upscale.quality), render.width,
                                                    render.height, output.width, output.height);
@@ -281,7 +299,8 @@ bool SceneRenderer::SetupUpscaler(VkExtent2D output) {
             create.display = output;
             create.quality = upscale.quality;
             create.dlss_model = upscale.dlss_model;
-            create.color_format = kHdrTargetFormat;
+            create.color_format = hdr ? kHdrTargetFormat : VK_FORMAT_R8G8B8A8_UNORM;
+            create.hdr = hdr;
             bool created = false;
             renderer_->Context().Submit([&](VkCommandBuffer cmd) { created = up_.backend->Create(cmd, create); });
             if (!created) {
@@ -301,6 +320,7 @@ bool SceneRenderer::SetupUpscaler(VkExtent2D output) {
         up_.created_settings = key_settings;
         up_.created_render = render;
         up_.created_output = output;
+        up_.created_hdr = hdr;
         up_.reset = true;
         up_.jitter_index = 0;
         upscale_ms_sum_ = inputs_ms_sum_ = gpu_ms_sum_ = cpu_ms_sum_ = 0.0;
@@ -317,6 +337,11 @@ bool SceneRenderer::SetupUpscaler(VkExtent2D output) {
     }
     up_.jitter_ndc = 2.0f * up_.jitter_pixels / glm::vec2(static_cast<float>(render.width), static_cast<float>(render.height));
     up_.mip_bias = up_.backend ? up_.backend->MipBias(static_cast<float>(render.width) / static_cast<float>(output.width)) : 0.0f;
+    if (upscale_after_post) {
+        // half the upscaler's texture LOD bias: the full one (-1.58 at 640 -> 1920) has the G-buffer fetch textures as at the output size,
+        // which costs more texture bandwidth than the Switch 2 has to spare at 60 fps
+        up_.mip_bias *= 0.5f;
+    }
     if (const char* bias = std::getenv("PT_UPSCALE_MIP_BIAS")) {
         up_.mip_bias = static_cast<float>(std::atof(bias));
     }
@@ -423,7 +448,8 @@ void SceneRenderer::RecordUpscaleInputs(VkCommandBuffer cmd, const ViewSetup& vi
             break;
         }
     }
-    handy_demod_ = demod_on && handy != gpu::kInvalid && handy_factor_.Valid();
+    // not after the post-processing: the demodulation works on the HDR light (the resolve puts the flashlight back before the post-processing)
+    handy_demod_ = demod_on && !upscale_after_post && handy != gpu::kInvalid && handy_factor_.Valid();
     if (handy_demod_) {
         UseTargets(cmd, {{&hdr_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
                          {&diffuse_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -465,7 +491,7 @@ void SceneRenderer::RecordUpscale(VkCommandBuffer cmd, float dt) {
         d.exposure = Wrap(exposure_image_);
         d.output = Wrap(upscaled_);
         d.render = extent_;
-        d.display = output_extent_;
+        d.display = display_extent_;
         d.jitter = up_.jitter_pixels;
         d.motion_scale = glm::vec2(static_cast<float>(extent_.width), static_cast<float>(extent_.height));
         d.pre_exposure = std::max(exposure_, 1.0e-12f);
@@ -551,6 +577,56 @@ void SceneRenderer::RecordUpscale(VkCommandBuffer cmd, float dt) {
     }
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot.upscale_queries, 3);
     slot.upscale_timed = true;
+}
+
+// upscale_after_post (the Switch 2 with FSR 2): the upscaler takes the post-processed, tonemapped image at the render size (ldr_[current])
+// with the render-size depth, motion vectors and reactive mask, and writes upscaled_ at the display size; RecordPost's final screen pass
+// then reads upscaled_. Exposure is 1 (the image is already exposed and tonemapped). Writes upscale timestamp 2; RecordPost writes 3
+// after the final pass, so the upscale time covers everything at the output size. Returns whether upscaled_ holds this frame.
+bool SceneRenderer::RecordLateUpscale(VkCommandBuffer cmd, int current, float dt) {
+    FrameSlot& slot = slots_[renderer_->FrameIndex()];
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot.upscale_queries, 2);
+    UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+    VkClearColorValue value{};
+    value.float32[0] = 1.0f;
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, exposure_image_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+    UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    bool upscaled = false;
+    if (up_.backend) {
+        RenderTarget& color = ldr_[current];
+        UseTargets(cmd, {{&color, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                         {&depth_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                         {&motion_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                         {&reactive_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                         {&upscaled_, VK_IMAGE_LAYOUT_GENERAL}});
+        UpscaleDispatch d;
+        d.cmd = cmd;
+        d.color = Wrap(color);
+        d.depth = Wrap(depth_);
+        d.motion = Wrap(motion_);
+        d.reactive = Wrap(reactive_);
+        d.exposure = Wrap(exposure_image_);
+        d.output = Wrap(upscaled_);
+        d.render = extent_;
+        d.display = display_extent_;
+        d.jitter = up_.jitter_pixels;
+        d.motion_scale = glm::vec2(static_cast<float>(extent_.width), static_cast<float>(extent_.height));
+        d.pre_exposure = 1.0f;
+        d.sharpness = upscale.sharpness;
+        d.frame_ms = std::clamp(dt, 1.0e-4f, 0.25f) * 1000.0f;
+        d.near_plane = camera_.near_plane;
+        d.fov_y = camera_.fov_y;
+        d.reset = up_.reset;
+        d.frame_index = frame_counter_;
+        upscaled = up_.backend->Dispatch(d);
+        UseTargets(cmd, {{&upscaled_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
+        if (!upscaled && upscale_stats_.error.empty()) {
+            upscale_stats_.error = "dispatch failed, see pt.log";
+        }
+    }
+    up_.reset = false;
+    return upscaled;
 }
 
 void SceneRenderer::ReadUpscaleTimestamps(FrameSlot& slot) {

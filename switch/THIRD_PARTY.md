@@ -17,6 +17,7 @@ distributed under the GPL version 3 (`third_party/lsfg-vk/LICENSE.md` holds its 
 | stb | MIT / public domain | https://github.com/nothings/stb |
 | Lua 5.1 | MIT | https://www.lua.org |
 | libogg, libvorbis | BSD-3-Clause | https://github.com/xiph/ogg, https://github.com/xiph/vorbis |
+| AMD FidelityFX Super Resolution 2.2.1 (Switch 2 build: temporal upscaling; runtime, Vulkan backend and shaders, the shaders compiled by `tools/fsr2_vk_shaders.py`) | MIT | https://github.com/GPUOpen-Effects/FidelityFX-FSR2, revision `1680d1e` |
 | SMAA 1x (anti-aliasing, `shaders/smaa/`, with its lookup tables in `src/engine/render/smaa_tables.h`) | MIT | https://github.com/iryoku/smaa |
 | bc7enc_rdo | MIT / public domain | https://github.com/richgel999/bc7enc_rdo |
 | Expat | MIT | https://github.com/libexpat/libexpat |

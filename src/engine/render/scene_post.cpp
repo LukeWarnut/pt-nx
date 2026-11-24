@@ -265,12 +265,26 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
         run(banding_, push);
     }
 
+    // upscale_after_post: the upscaler takes the finished post-processing at the render size, and the final screen pass below (distortion,
+    // clarity, dither, the screen-layer effects) runs at the output size on its result
+    const bool late = UpscaleLate();
+    uint32_t final_source = ldr_index(current);
+    VkExtent2D final_extent = output_extent_;
+    if (late) {
+        BeginLabel(cmd, "upscale (after post)");
+        if (RecordLateUpscale(cmd, current, dt)) {
+            final_source = gpu::kImgUpscaled;
+        }
+        EndLabel(cmd);
+        final_extent = display_extent_;
+    }
+
     RenderTarget output;
     output.image = renderer_->SceneColor();
     output.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     UseTargets(cmd, {{&output, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, output_extent_, {{&output, false, {}}});
-    push.ids = glm::uvec4(ldr_index(current), 0, 0, post_view_);
+    BeginPass(cmd, final_extent, {{&output, false, {}}});
+    push.ids = glm::uvec4(final_source, 0, 0, post_view_);
     const bool grain = toggles.film_grain && screen.film_grain && lighting.valid;
     const bool distortion = toggles.distortion && screen.screen_distortion && lighting.valid;
     push.f0 = glm::vec4(distortion ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
@@ -284,11 +298,16 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
     if (vfx_filter && vr_eye_ < 0) {
         SceneFilterContext context = FilterContext(cmd, 2u);
         context.color_format = Renderer::kSceneColorFormat;
+        context.extent = final_extent;
         vfx_filter(context);
         BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
     }
     vkCmdEndRendering(cmd);
-    (void)dt;
+    if (late) {
+        FrameSlot& slot = slots_[renderer_->FrameIndex()];
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot.upscale_queries, 3);
+        slot.upscale_timed = true;
+    }
 }
 
 SceneFilterContext SceneRenderer::FilterContext(VkCommandBuffer cmd, uint32_t layers) const {

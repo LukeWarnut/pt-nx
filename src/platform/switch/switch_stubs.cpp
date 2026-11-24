@@ -34,7 +34,9 @@ namespace pt {
 
 // upscalers ------------------------------------------------------------------------------------------------------------
 
+#if !defined(PT_WITH_FSR2)  // the Switch 2 build has FSR 2 (engine/render/upscale/fsr2_backend.cpp)
 std::unique_ptr<UpscaleBackend> CreateFsrBackend(vk::Context&, int) { return nullptr; }
+#endif
 std::unique_ptr<UpscaleBackend> CreateDlssBackend(vk::Context&) { return nullptr; }
 std::unique_ptr<UpscaleBackend> CreateStreamlineDlssBackend(vk::Context&) { return nullptr; }
 std::unique_ptr<UpscaleBackend> CreateXessBackend(vk::Context&) { return nullptr; }

@@ -528,7 +528,7 @@ void SceneRenderer::PrepareFrame(const Camera& camera, const std::vector<DrawIte
 
     mirror_active_ = false;
     mirror_stale_active_ = false;
-    mirror_temporal_enabled_ = up_.enabled && !std::getenv("PT_MIRROR_TEMPORAL_OFF");
+    mirror_temporal_enabled_ = up_.enabled && !upscale_after_post && !std::getenv("PT_MIRROR_TEMPORAL_OFF");
     mirrors_.clear();
     static const bool trace_active = std::getenv("PT_MIRROR_TRACE") != nullptr;
     if (trace_active) {
@@ -1922,7 +1922,8 @@ void SceneRenderer::RecordLighting(VkCommandBuffer cmd, const ViewSetup& view, u
         return v && std::string_view(v) == "legacy";
     }();
     const bool ao = rt_ao_ready_ && view.index == main_view_.index;
-    const bool shrink = !up_.enabled && !ao && !legacy_resolve;
+    // the desktop upscalers get full-resolution light; upscale_after_post (the Switch 2) keeps the half-resolution lights and probes
+    const bool shrink = (!up_.enabled || upscale_after_post) && !ao && !legacy_resolve;
     const bool contact = rt_contact_active_ && view.index == main_view_.index;
     const bool single_pass = toggles.light_single_pass && light_all_ != VK_NULL_HANDLE && !(rt_active_ || contact);
     // half-resolution lights: the lights are evaluated for one pixel of each 2x2 block (the sample the probe shrink mode uses) into two half-size
@@ -2721,7 +2722,8 @@ void SceneRenderer::RecordReflections(VkCommandBuffer cmd, const ViewSetup& view
     push.f2 = glm::vec4(1.0f / static_cast<float>(refmap_.Extent().width), 1.0f / static_cast<float>(refmap_.Extent().height), 0.0f, 0.0f);
     static const bool march_fixed = std::getenv("PT_REFLECT_MARCH_FIXED") != nullptr;
     static const bool temporal_off_march = std::getenv("PT_REFLECT_TEMPORAL_OFF") != nullptr;
-    if (up_.enabled && !temporal_off_march && !march_fixed && reflect_layer_.Valid() && reflect_temporal_pipeline_ && reflect_layer_pipeline_) {
+    if (up_.enabled && !upscale_after_post && !temporal_off_march && !march_fixed && reflect_layer_.Valid() && reflect_temporal_pipeline_ &&
+        reflect_layer_pipeline_) {
         push.f2.z = 1.0f;
         push.f2.w = static_cast<float>(frame_counter_ % 64u);
     }
@@ -2769,7 +2771,7 @@ void SceneRenderer::RecordReflections(VkCommandBuffer cmd, const ViewSetup& view
     push.f1 = glm::vec4(1.0f, 1.0f, screen.reflect_scale, screen.reflect_bias);
     push.f2 = glm::vec4(horizontal, screen.reflect_edge ? 1.0f : 0.0f);
     static const bool temporal_off = std::getenv("PT_REFLECT_TEMPORAL_OFF") != nullptr;
-    if (up_.enabled && !temporal_off && reflect_layer_.Valid() && reflect_temporal_pipeline_ &&
+    if (up_.enabled && !upscale_after_post && !temporal_off && reflect_layer_.Valid() && reflect_temporal_pipeline_ &&
         (rt_reflections_ ? reflect_layer_rt_ : reflect_layer_pipeline_)) {
         RecordReflectionTemporal(cmd, view, push);
         return;
@@ -3141,7 +3143,9 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
     if(!EnsureShadowTarget()) return;
     const VkExtent2D output = renderer_->RenderExtent();
     const bool upscaling = BeginUpscaleFrame(output);
-    if (!EnsureTargets(upscaling ? up_.render : output, output, upscaling)) {
+    // upscale_after_post: the post-processing stays at the render size too, only the upscaler's output is at the renderer's size
+    const bool late = upscaling && upscale_after_post;
+    if (!EnsureTargets(upscaling ? up_.render : output, late ? up_.render : output, upscaling, output)) {
         return;
     }
     // after a render size change without a GPU wait: this slot's last frame is done (its fence was waited for in BeginFrame), so its sets
@@ -3345,7 +3349,7 @@ void SceneRenderer::Render(const Camera& camera, const std::vector<DrawItem>& it
             EndLabel(cmd);
         }
         Stamp(cmd, 9);
-        if (up_.enabled) {
+        if (up_.enabled && !upscale_after_post) {  // after the post-processing instead: RecordPost
             BeginLabel(cmd, "upscale");
             RecordUpscale(cmd, dt);
             EndLabel(cmd);

@@ -1114,14 +1114,48 @@ extern "C" void pt_switch_window_apply_size(unsigned width, unsigned height) {
 }
 #endif
 
-extern "C" unsigned pt_switch_set_gpu_mhz(unsigned mhz) {
-    if (!EnsureClocks()) return 0;
+// The GPU rates the automatic clock can ask for, in Hz, ascending. The Switch reports a discrete list. The Switch 2 reports a range (min, max:
+// 306-1389 MHz through clkrst), and the automatic clock was off there because only lists were read: a range becomes a ladder of rates in it
+// that includes the console's own handheld (561 MHz) and docked (1007 MHz) GPU rates. The rate read back after a request is the one logged.
+static s32 GpuRateList(u32* out, s32 max) {
     u32 rates[40] = {};
     s32 count = 0;
     PcvClockRatesListType type = PcvClockRatesListType_Invalid;
-    const Result list = g_clk_state == 1 ? clkrstGetPossibleClockRates(&g_clk_gpu, rates, 40, &type, &count)
-                                          : pcvGetPossibleClockRates(PcvModule_GPU, rates, 40, &type, &count);
-    if (R_FAILED(list) || count <= 0 || type != PcvClockRatesListType_Discrete) return 0;
+    const Result rc = g_clk_state == 1 ? clkrstGetPossibleClockRates(&g_clk_gpu, rates, 40, &type, &count)
+                                        : pcvGetPossibleClockRates(PcvModule_GPU, rates, 40, &type, &count);
+    if (R_FAILED(rc) || count <= 0) return 0;
+    if (type == PcvClockRatesListType_Discrete) {
+        const s32 n = std::min(std::min(count, s32{40}), max);
+        std::copy(rates, rates + n, out);
+        return n;
+    }
+    if (type != PcvClockRatesListType_Range || count < 2 || rates[1] <= rates[0]) return 0;
+    // Opt-in only (PT_GPU_RANGE_CLOCK=1 in romfs:/test_env.txt): the first build that set the Switch 2's GPU clock from the range froze the
+    // console in the opening scene, and the homebrew menu would not start again from HOME until a reboot. Without it the Switch 2's clock is
+    // left alone (no rates: the automatic clock stays off, as before).
+    static const bool range_clock = [] {
+        const char* v = std::getenv("PT_GPU_RANGE_CLOCK");
+        return v && std::atoi(v) != 0;
+    }();
+    if (!range_clock) return 0;
+    static constexpr u32 kLadderMhz[] = {408, 510, 561, 612, 714, 816, 918, 1007, 1100, 1200, 1300};
+    const u32 lo = rates[0];
+    const u32 hi = rates[1];
+    s32 n = 0;
+    if (n < max) out[n++] = lo;
+    for (u32 mhz : kLadderMhz) {
+        const u32 hz = mhz * 1000000u;
+        if (hz > lo && hz < hi && n < max) out[n++] = hz;
+    }
+    if (n < max) out[n++] = hi;
+    return n;
+}
+
+extern "C" unsigned pt_switch_set_gpu_mhz(unsigned mhz) {
+    if (!EnsureClocks()) return 0;
+    u32 rates[40] = {};
+    const s32 count = GpuRateList(rates, 40);
+    if (count <= 0) return 0;
     u32 pick = rates[0];
     for (s32 i = 0; i < count && i < 40; ++i) {
         if (rates[i] / 1000000u <= mhz && rates[i] > pick) pick = rates[i];
@@ -1139,15 +1173,11 @@ extern "C" unsigned pt_switch_set_gpu_mhz(unsigned mhz) {
     return now / 1000000u;
 }
 
-// the allowed GPU rates in MHz, ascending; returns how many
+// the allowed GPU rates in MHz, ascending (a range: the ladder of GpuRateList); returns how many
 extern "C" unsigned pt_switch_gpu_rates(unsigned* out_mhz, unsigned max) {
     if (!EnsureClocks()) return 0;
     u32 rates[40] = {};
-    s32 count = 0;
-    PcvClockRatesListType type = PcvClockRatesListType_Invalid;
-    const Result rc = g_clk_state == 1 ? clkrstGetPossibleClockRates(&g_clk_gpu, rates, 40, &type, &count)
-                                        : pcvGetPossibleClockRates(PcvModule_GPU, rates, 40, &type, &count);
-    if (R_FAILED(rc) || type != PcvClockRatesListType_Discrete) return 0;
+    const s32 count = GpuRateList(rates, 40);
     unsigned n = 0;
     for (s32 i = 0; i < count && i < 40 && n < max; ++i) out_mhz[n++] = rates[i] / 1000000u;
     return n;

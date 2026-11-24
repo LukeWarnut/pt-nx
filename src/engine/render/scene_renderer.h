@@ -244,6 +244,14 @@ public:
     std::string ShadowMoving() const { return shadow_moving_count_ ? std::to_string(shadow_moving_count_) + shadow_moving_ : std::string("none"); }
     const RenderStats& Stats() const { return stats_; }
     UpscaleSettings upscale;
+    // with an upscaler: render at exactly this size (0: the quality mode's ratio of the output); the Switch 2's dynamic resolution sets it
+    VkExtent2D upscale_render_size{0, 0};
+    // With an upscaler, upscale after the post-processing instead of before it (the Switch 2 with FSR 2): the scene and every
+    // post-processing pass stay at the render size, the upscaler takes the tonemapped image, and only it and the final screen pass
+    // (distortion, clarity, dither, screen-layer effects) run at the output size. It also keeps the render-size savings the desktop
+    // upscaler path turns off (half-resolution lights, quarter-resolution probes) and leaves out its extra temporal passes (reflections,
+    // mirror view, flashlight demodulation).
+    bool upscale_after_post = false;
     const UpscaleStats& UpscaleStatistics() const { return upscale_stats_; }
     bool UpscalerAvailable(UpscalerKind kind, std::string& reason);
     void RequestTargetDump() { dump_requested_ = true; }
@@ -325,7 +333,8 @@ private:
     bool CreatePipelines();
     void DestroyPipelines();
     bool CreateDescriptors();
-    bool EnsureTargets(VkExtent2D extent, VkExtent2D output, bool upscaling);
+    // extent: the scene's size; output: the post-processing's; display: the upscaler's output (0: output)
+    bool EnsureTargets(VkExtent2D extent, VkExtent2D output, bool upscaling, VkExtent2D display = {0, 0});
     // retire: the images go to retired_images_ (destroyed once no frame in flight uses them) instead of being destroyed at once
     void DestroyTargets(std::vector<vk::Image>* retire = nullptr);
     void RecordTargetClears(VkCommandBuffer cmd, VkExtent2D extent);
@@ -390,8 +399,8 @@ private:
 
     bool CreateUpscalePipelines();
     void DestroyUpscalePipelines();
-    bool CreateUpscaleTargets(VkExtent2D render, VkExtent2D output);
-    void DestroyUpscaleTargets();
+    bool CreateUpscaleTargets(VkExtent2D render, VkExtent2D output, bool post_targets = true);
+    void DestroyUpscaleTargets(std::vector<vk::Image>* retire = nullptr);
     void WriteUpscaleDescriptors(VkDescriptorImageInfo* images, bool post);
     bool BeginUpscaleFrame(VkExtent2D output);
     bool SetupUpscaler(VkExtent2D output);
@@ -401,6 +410,9 @@ private:
     void RecordEffects(VkCommandBuffer cmd, RenderTarget& output, SceneVfxContext context);
     void RecordUpscaleInputs(VkCommandBuffer cmd, const ViewSetup& view);
     void RecordUpscale(VkCommandBuffer cmd, float dt);
+    // upscale_after_post: the upscaler on the post-processed image ldr_[current], then the final screen pass at the output size
+    bool RecordLateUpscale(VkCommandBuffer cmd, int current, float dt);
+    bool UpscaleLate() const { return up_.enabled && upscale_after_post; }
     void ReadUpscaleTimestamps(FrameSlot& slot);
 
     static constexpr uint32_t kTimestamps = 15;  // 12-14: inside the main view's lighting pass (see RecordLighting)
@@ -497,7 +509,9 @@ private:
     vk::Buffer dump_scene_;
     vk::Buffer dump_mirror_;
     VkExtent2D output_extent_{0, 0};
+    VkExtent2D display_extent_{0, 0};  // the upscaler's output size (output_extent_ unless upscale_after_post)
     bool targets_upscaled_ = false;
+    bool targets_late_ = false;  // the targets were made for upscale_after_post
     bool history_valid_ = false;
     // TAA state: the jitter of this frame, whether the history (history_) holds the previous resolved image, and a camera cut
     bool taa_active_ = false;
@@ -703,6 +717,7 @@ private:
         VkExtent2D render{};
         VkExtent2D created_render{};
         VkExtent2D created_output{};
+        bool created_hdr = true;
         bool enabled = false;
         bool created = false;
         bool reset = true;

@@ -23,7 +23,12 @@ struct KindInfo {
     const char* key;
 };
 
-constexpr KindInfo kKinds[] = {{"Off", "off"},           {"AMD FSR 3", "fsr3"},          {"NVIDIA DLSS", "dlss"},
+#if defined(PT_WITH_FSR2)
+#define PT_FSR_NAME "AMD FSR 2"  // the Switch 2 build's FSR backend (fsr2_backend.cpp)
+#else
+#define PT_FSR_NAME "AMD FSR 3"
+#endif
+constexpr KindInfo kKinds[] = {{"Off", "off"},           {PT_FSR_NAME, "fsr3"},          {"NVIDIA DLSS", "dlss"},
                                {"Intel XeSS", "xess"},    {"Spatial (test)", "spatial"}, {"AMD FSR 4", "fsr4"}};
 
 constexpr const char* kDlssModels[] = {"auto", "k", "l", "m"};

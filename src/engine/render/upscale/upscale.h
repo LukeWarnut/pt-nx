@@ -105,6 +105,7 @@ struct UpscaleCreate {
     UpscaleQuality quality = UpscaleQuality::Quality;
     DlssModel dlss_model = DlssModel::Auto;
     VkFormat color_format = VK_FORMAT_UNDEFINED;
+    bool hdr = true;  // false: the colour input is the tonemapped, post-processed image (the upscaler runs after the post-processing)
 };
 
 class UpscaleBackend {
@@ -117,6 +118,8 @@ public:
     virtual bool Dispatch(const UpscaleDispatch& dispatch) = 0;
     virtual void Release() = 0;
     virtual float MipBias(float render_over_display) const;
+    // true: one context takes any render size up to the output size (Create's display), so a dynamic resolution change keeps it
+    virtual bool DynamicResolution() const { return false; }
 };
 
 class UpscaleHost : public vk::ContextHooks {

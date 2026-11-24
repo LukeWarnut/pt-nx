@@ -252,6 +252,47 @@ else()
   message(WARNING "glslc not found (install the Vulkan SDK or set VULKAN_SDK): the shaders are not compiled, see switch/README.md")
 endif()
 
+# ---- FSR 2 (Switch 2) ---------------------------------------------------------------------------------------------------------
+# AMD FidelityFX Super Resolution 2.2.1 (MIT, github.com/GPUOpen-Effects/FidelityFX-FSR2), built from source: the scene renders at the
+# dynamic resolution's size and FSR 2 upscales it to the screen (1080p at most). Its Vulkan shader permutations are normally made by AMD's
+# FidelityFX_SC.exe (Windows only); tools/fsr2_vk_shaders.py makes the same headers with glslc, for the permutations the engine uses.
+# The runtime is MSVC-flavoured C++: src/platform/switch/fsr2/ffx_compat.h supplies what newlib lacks.
+option(PT_FSR2 "Switch 2: build AMD FSR 2 (temporal upscaling of the scene to the screen)" ON)
+if(PT_SWITCH2 AND PT_FSR2)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  if(NOT GLSLC)
+    message(FATAL_ERROR "FSR 2 needs glslc for its shaders (install the Vulkan SDK, or configure with -DPT_FSR2=OFF)")
+  endif()
+  FetchContent_Declare(fsr2 URL https://github.com/GPUOpen-Effects/FidelityFX-FSR2/archive/1680d1edd5c034f88ebbbb793d8b88f8842cf804.tar.gz
+    URL_HASH SHA256=19df8378ea882d437a6d61eeaa1c50b7e091fe409dd3029be8f0d819c7a89d75)
+  FetchContent_Populate(fsr2)
+  set(PT_FSR2_API ${fsr2_SOURCE_DIR}/src/ffx-fsr2-api)
+  set(PT_FSR2_GEN ${CMAKE_BINARY_DIR}/fsr2-shaders)
+  file(GLOB PT_FSR2_SHADER_SOURCES ${PT_FSR2_API}/shaders/*.h ${PT_FSR2_API}/shaders/*.glsl)
+  set(PT_FSR2_HEADERS)
+  foreach(pass tcr_autogen autogen_reactive accumulate compute_luminance_pyramid depth_clip lock reconstruct_previous_depth rcas)
+    list(APPEND PT_FSR2_HEADERS ${PT_FSR2_GEN}/ffx_fsr2_${pass}_pass_permutations.h)
+  endforeach()
+  add_custom_command(OUTPUT ${PT_FSR2_HEADERS}
+    COMMAND ${Python3_EXECUTABLE} -I ${PT_ROOT}/tools/fsr2_vk_shaders.py --glslc ${GLSLC} --src ${PT_FSR2_API}/shaders --out ${PT_FSR2_GEN}
+    DEPENDS ${PT_ROOT}/tools/fsr2_vk_shaders.py ${PT_FSR2_SHADER_SOURCES}
+    COMMENT "FSR 2 shader permutations"
+    VERBATIM)
+  add_library(pt_fsr2 STATIC
+    ${PT_FSR2_API}/ffx_fsr2.cpp
+    ${PT_FSR2_API}/ffx_assert.cpp
+    ${PT_FSR2_API}/vk/ffx_fsr2_vk.cpp
+    ${PT_FSR2_API}/vk/shaders/ffx_fsr2_shaders_vk.cpp
+    ${PT_FSR2_HEADERS})
+  set_target_properties(pt_fsr2 PROPERTIES CXX_STANDARD 17)  # std::codecvt_utf8_utf16 (C++17, removed later)
+  target_include_directories(pt_fsr2 PUBLIC ${PT_FSR2_API} PRIVATE ${PT_FSR2_GEN})
+  target_compile_definitions(pt_fsr2 PUBLIC FFX_GCC)
+  target_compile_options(pt_fsr2 PRIVATE -w -include ${PT_ROOT}/src/platform/switch/fsr2/ffx_compat.h -ffunction-sections -fdata-sections)
+  target_link_libraries(pt_fsr2 PUBLIC pt_thirdparty)
+  target_link_libraries(pt PRIVATE pt_fsr2)
+  target_compile_definitions(pt PRIVATE PT_WITH_FSR2=1)
+endif()
+
 # ---- .nro ---------------------------------------------------------------------------------------------------------------------
 
 set(DEVKITPRO $ENV{DEVKITPRO})
