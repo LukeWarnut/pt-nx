@@ -241,6 +241,8 @@ public:
     static constexpr uint32_t kShadowAtlasSize = 8192;
     std::function<void(const SceneVfxContext&)> vfx_forward;
     std::function<void(const SceneFilterContext&)> vfx_filter;
+    // whether vfx_filter draws anything for these layers this frame (1: flare, 2: screen); unset: assumed to
+    std::function<bool(uint32_t layers)> vfx_filter_draws;
     std::string ShadowMoving() const { return shadow_moving_count_ ? std::to_string(shadow_moving_count_) + shadow_moving_ : std::string("none"); }
     const RenderStats& Stats() const { return stats_; }
     UpscaleSettings upscale;
@@ -375,6 +377,7 @@ private:
     void RecordReflectionTemporal(VkCommandBuffer cmd, const ViewSetup& view, gpu::PassPush push);
     void RecordMirrorTemporal(VkCommandBuffer cmd);
     bool RecordDepthOfField(VkCommandBuffer cmd, const ScreenSettings& screen, int& current);
+    static bool DepthOfFieldRuns(const ScreenSettings& screen);  // whether RecordDepthOfField records its passes
     bool RecordMotionBlur(VkCommandBuffer cmd, const ScreenSettings& screen, int& current);
     bool MotionBlurActive() const;
     void RecordObjectVelocity(VkCommandBuffer cmd, const ViewSetup& view);
@@ -498,6 +501,7 @@ private:
     RenderTarget handy_factor_;
     bool handy_demod_ = false;
     RenderTarget exposure_image_;
+    float exposure_image_value_ = -1.0f;  // what exposure_image_ holds (-1: not known), so an unchanged value is not cleared again
     RenderTarget upscaled_;
     RenderTarget post_hdr_;
     RenderTarget post_depth_;
@@ -517,6 +521,9 @@ private:
     bool taa_active_ = false;
     bool taa_cut_ = true;
     bool taa_history_valid_ = false;
+    // RecordPost leaves out work that does not change the image: the colour LUT in the tonemap pass when no pass runs between them, no
+    // flare target clear (or read) on frames without flares, the late upscaler's exposure cleared once. PT_POST_LEAN=0 for A/B runs
+    bool post_lean_ = true;
     uint32_t taa_index_ = 0;
     glm::vec2 taa_jitter_ndc_{0.0f};
     VkExtent2D taa_extent_{};

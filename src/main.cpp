@@ -3778,6 +3778,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
     if (vfx_pass.Init(app.renderer, app.textures, vfs)) {
         app.scene.vfx_forward = [&vfx_pass](const pt::SceneVfxContext& c) { vfx_pass.RecordForward(c); };
         app.scene.vfx_filter = [&vfx_pass](const pt::SceneFilterContext& c) { vfx_pass.RecordFilter(c); };
+        app.scene.vfx_filter_draws = [&vfx_pass](uint32_t layers) { return vfx_pass.HasFilterDraws(layers); };
     }
     pt::game::RenderSceneBuilder scene_builder;
     pt::SceneLighting lighting;
@@ -5710,6 +5711,7 @@ int RunGame(App& app, pt::Vfs& vfs) {
     vkDeviceWaitIdle(app.renderer.Context().device);
     app.scene.vfx_forward = nullptr;
     app.scene.vfx_filter = nullptr;
+    app.scene.vfx_filter_draws = nullptr;
     vfx_pass.Shutdown();
     app.renderer.overlay = nullptr;
     ui.Shutdown();

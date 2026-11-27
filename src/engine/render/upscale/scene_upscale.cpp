@@ -161,6 +161,7 @@ bool SceneRenderer::CreateUpscaleTargets(VkExtent2D render, VkExtent2D output, b
 void SceneRenderer::DestroyUpscaleTargets(std::vector<vk::Image>* retire) {
     vk::Context& ctx = renderer_->Context();
     RenderTarget* targets[] = {&motion_, &reactive_, &opaque_, &handy_factor_, &exposure_image_, &upscaled_, &post_hdr_, &post_depth_, &post_object_velocity_};
+    exposure_image_value_ = -1.0f;
     for (RenderTarget* t : targets) {
         // retire: kept until the frame still in flight is done (a size change without a GPU wait, EnsureTargets)
         if (retire && t->image.image) {
@@ -475,6 +476,7 @@ void SceneRenderer::RecordUpscale(VkCommandBuffer cmd, float dt) {
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, exposure_image_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
     UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    exposure_image_value_ = exposure_;
     bool upscaled = false;
     if (up_.backend) {
         UseTargets(cmd, {{&hdr_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
@@ -586,12 +588,16 @@ void SceneRenderer::RecordUpscale(VkCommandBuffer cmd, float dt) {
 bool SceneRenderer::RecordLateUpscale(VkCommandBuffer cmd, int current, float dt) {
     FrameSlot& slot = slots_[renderer_->FrameIndex()];
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, slot.upscale_queries, 2);
-    UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    VkClearColorValue value{};
-    value.float32[0] = 1.0f;
-    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cmd, exposure_image_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
-    UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    // the exposure is always 1 here: cleared once (after the targets are made), not a clear and two barriers every frame
+    if (exposure_image_value_ != 1.0f || !post_lean_) {
+        UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        VkClearColorValue value{};
+        value.float32[0] = 1.0f;
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, exposure_image_.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &value, 1, &range);
+        UseTargets(cmd, {{&exposure_image_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+        exposure_image_value_ = 1.0f;
+    }
     bool upscaled = false;
     if (up_.backend) {
         RenderTarget& color = ldr_[current];

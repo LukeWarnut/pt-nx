@@ -925,6 +925,7 @@ void SceneRenderer::RecordTargetClears(VkCommandBuffer cmd, VkExtent2D extent) {
             UseTargets(cmd, {{t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
         }
     }
+    exposure_image_value_ = exposure_image_.Valid() ? 0.0f : -1.0f;
 }
 
 void SceneRenderer::WriteImageDescriptors(uint32_t slot_mask) {

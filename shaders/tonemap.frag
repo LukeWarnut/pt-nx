@@ -28,7 +28,9 @@ void main() {
         c = ImgFetch(pass.ids.x, pixel).rgb;
     } else {
         vec3 hdr = ImgFetch(IMG_HDR, pixel).rgb * pass.f0.z;
-        vec3 x = min(SrgbEncode(clamp(hdr, 0.0, 1.0)) + max(ImgFetch(IMG_FLARE, pixel).rgb, vec3(0.0)), vec3(1.0));
+        // f1.x: lens flares were drawn into IMG_FLARE this frame (RecordPost skips the target and its read on frames without any)
+        vec3 flare = pass.f1.x > 0.0 ? max(ImgFetch(IMG_FLARE, pixel).rgb, vec3(0.0)) : vec3(0.0);
+        vec3 x = min(SrgbEncode(clamp(hdr, 0.0, 1.0)) + flare, vec3(1.0));
         vec2 bloom_uv = in_uv + 0.5 / ImgSize(IMG_BLOOM_SUM);
         vec3 b = pass.f0.x > 0.0 ? min(vec3(0.5), Img(IMG_BLOOM_SUM, SMP_LINEAR_CLAMP, bloom_uv).rgb) : vec3(0.0);
         vec3 x2 = x * x;
@@ -36,6 +38,7 @@ void main() {
         c = clamp(r * inversesqrt(max(vec3(1.0 / 512.0), r)), 0.0, 1.0);
     }
     vec3 graded = c;
+    // f0.w: the colour LUT (its own pass with ids.y 1, or here in the tonemap pass when no pass runs between the two)
     if (pass.f0.w > 0.0) {
         graded = Lut16(RES_COLOR_LUT, c);
         if (pass.f0.y < 1.0) {

@@ -71,8 +71,21 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
     gpu::PassPush push;
     push.ids.w = post_view_;
 
-    const char* native_order_override = std::getenv("PT_AA_NATIVE_ORDER");
-    const bool native_aa_order = toggles.fxaa && !up_.enabled && native_order_override && std::string(native_order_override) == "1";
+    static const bool native_order_override = [] {
+        const char* e = std::getenv("PT_AA_NATIVE_ORDER");
+        return e && std::string(e) == "1";
+    }();
+    const bool native_aa_order = toggles.fxaa && !up_.enabled && native_order_override;
+
+    // the passes that will run between the tonemap and the colour LUT (with none, the tonemap pass applies the LUT itself)
+    const bool taa_run = taa_active_ && taa_;
+    const bool smaa_run = !taa_run && toggles.smaa && !up_.enabled && smaa_edges_pipe_ && smaa_weights_pipe_ && smaa_blend_pipe_ && smaa_area_.view &&
+                          smaa_search_.view;
+    const bool fxaa_run = toggles.fxaa && !up_.enabled && !native_aa_order && !taa_run && !smaa_run;
+    const bool dof_run = toggles.depth_of_field && screen.depth_of_field && lighting.valid && DepthOfFieldRuns(screen);
+    const bool mb_run = toggles.motion_blur && screen.motion_blur && lighting.valid && screen.shutter_speed >= 0.001f;
+    static const bool tonemap_test = std::getenv("PT_TONEMAP_TEST") != nullptr;
+    const bool fold_lut = post_lean_ && toggles.color_lut && !tonemap_test && !taa_run && !smaa_run && !fxaa_run && !dof_run && !mb_run;
     if (native_aa_order) {
         UseTargets(cmd, {{&hdr_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {&hdr_copy_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
         BeginPass(cmd, output_extent_, {{&hdr_copy_, false, {}}});
@@ -138,14 +151,21 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
     }
     Stamp(cmd, 11);
 
-    UseTargets(cmd, {{&flare_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
-    BeginPass(cmd, output_extent_, {{&flare_, true, {}}});
-    if (vfx_filter && vr_eye_ < 0) {
-        vfx_filter(FilterContext(cmd, 1u));
-        BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    // lens flares (vfx layer 1) into flare_, added by the tonemap. Most frames have none: then no clear of the target and no read of it
+    const bool flares = vfx_filter && vr_eye_ < 0 && (!vfx_filter_draws || vfx_filter_draws(1u));
+    const bool flare_pass = flares || !post_lean_;
+    if (flare_pass) {
+        UseTargets(cmd, {{&flare_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, {&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}});
+        BeginPass(cmd, output_extent_, {{&flare_, true, {}}});
+        if (vfx_filter && vr_eye_ < 0) {
+            vfx_filter(FilterContext(cmd, 1u));
+            BindSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+        }
+        vkCmdEndRendering(cmd);
+        UseTargets(cmd, {{&flare_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
+    } else if (flare_.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        UseTargets(cmd, {{&flare_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});  // still bound in the image table
     }
-    vkCmdEndRendering(cmd);
-    UseTargets(cmd, {{&flare_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
 
     int current = 0;
     UseTargets(cmd, {{&hdr_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, {&ldr_[0], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}});
@@ -153,13 +173,17 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
     push.ids.x = 0;
     const float lut_blend = std::clamp(screen.lut_blend, 0.0f, 1.0f);
     push.f0 = glm::vec4(bloom ? 1.0f : 0.0f, lut_blend, lighting.valid ? 1.0f : renderer_->exposure, 0.0f);
-    static const bool tonemap_test = std::getenv("PT_TONEMAP_TEST") != nullptr;
     if (tonemap_test) {
         push.f0.x = 0.0f;
         push.f0.y = 0.0f;
         push.f0.w = 0.0f;
     }
-    Fullscreen(cmd, tonemap_, push);
+    {
+        gpu::PassPush tone = push;  // push itself goes on to the passes below as before
+        tone.f0.w = fold_lut ? 1.0f : 0.0f;
+        tone.f1 = glm::vec4(flare_pass ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+        Fullscreen(cmd, tonemap_, tone);
+    }
     vkCmdEndRendering(cmd);
     UseTargets(cmd, {{&ldr_[0], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
 
@@ -175,7 +199,6 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
     };
 
     // TAA runs in FXAA's place
-    const bool taa_run = taa_active_ && taa_;
     if (taa_run) {
         const bool fresh = taa_cut_ || !taa_history_valid_ || taa_extent_.width != output_extent_.width || taa_extent_.height != output_extent_.height;
         UseTargets(cmd, {{&depth_, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL}, {&taa_history_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
@@ -205,8 +228,6 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
         taa_history_valid_ = false;
     }
     // SMAA 1x: luma edges, blending weights, neighbourhood blending (shaders/smaa_*.frag)
-    const bool smaa_run = !taa_run && toggles.smaa && !up_.enabled && smaa_edges_pipe_ && smaa_weights_pipe_ && smaa_blend_pipe_ && smaa_area_.view &&
-                          smaa_search_.view;
     if (smaa_run) {
         gpu::PassPush smaa;
         smaa.ids = glm::uvec4(ldr_index(current), 0, 0, post_view_);
@@ -221,17 +242,17 @@ void SceneRenderer::RecordPost(VkCommandBuffer cmd, const SceneLighting& lightin
         UseTargets(cmd, {{&smaa_weights_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
         run(smaa_blend_pipe_, smaa);
     }
-    if (toggles.fxaa && !up_.enabled && !native_aa_order && !taa_run && !smaa_run) {
+    if (fxaa_run) {
         push.ids.x = ldr_index(current);
         run(fxaa_, push);
     }
-    if (toggles.depth_of_field && screen.depth_of_field && lighting.valid) {
+    if (dof_run) {
         RecordDepthOfField(cmd, screen, current);
     }
-    if (toggles.motion_blur && screen.motion_blur && lighting.valid) {
+    if (mb_run) {
         RecordMotionBlur(cmd, screen, current);
     }
-    if (toggles.color_lut) {
+    if (toggles.color_lut && !fold_lut) {
         gpu::PassPush lut;
         lut.ids = glm::uvec4(ldr_index(current), 1, 0, post_view_);
         lut.f0 = glm::vec4(0.0f, lut_blend, 1.0f, 1.0f);
@@ -331,11 +352,16 @@ void SceneRenderer::PostPass(VkCommandBuffer cmd, RenderTarget& target, VkPipeli
     UseTargets(cmd, {{&target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}});
 }
 
-bool SceneRenderer::RecordDepthOfField(VkCommandBuffer cmd, const ScreenSettings& screen, int& current) {
+bool SceneRenderer::DepthOfFieldRuns(const ScreenSettings& screen) {
     const float aperture = screen.aperture;
-    if ((screen.dof_flags & 2u) == 0 && (aperture == 0.0f || !(aperture < 100.0f))) {
+    return (screen.dof_flags & 2u) != 0 || (aperture != 0.0f && aperture < 100.0f);
+}
+
+bool SceneRenderer::RecordDepthOfField(VkCommandBuffer cmd, const ScreenSettings& screen, int& current) {
+    if (!DepthOfFieldRuns(screen)) {
         return false;
     }
+    const float aperture = screen.aperture;
     const float f = screen.focal_length * 0.001f;
     const float d = std::max(screen.focus_distance, 1.0e-5f);
     const float s = std::max(0.0f, f * f / aperture / std::max(d - f, 1.0e-5f)) * 26666.666f;
@@ -550,6 +576,9 @@ void SceneRenderer::ApplyEnvironmentOverrides() {
     }
     if (const char* legacy = std::getenv("PT_CONTACT_LEGACY")) {
         rt_contact_legacy_ = std::atoi(legacy) != 0;
+    }
+    if (const char* lean = std::getenv("PT_POST_LEAN")) {
+        post_lean_ = std::atoi(lean) != 0;
     }
 }
 

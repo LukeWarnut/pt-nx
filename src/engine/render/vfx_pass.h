@@ -26,6 +26,8 @@ public:
     void Submit(vfx::RenderList& list);
     void RecordForward(const SceneVfxContext& context);
     void RecordFilter(const SceneFilterContext& context);
+    // whether RecordFilter would draw anything for these layers this frame (1: flare, 2: screen)
+    bool HasFilterDraws(uint32_t layers) const;
     const vfx::RenderList& List() const { return list_; }
 
 private:

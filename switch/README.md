@@ -129,7 +129,8 @@ Set them from `romfs:/test_env.txt` inside an experiment .nro (one `NAME=VALUE` 
 assembly, `PT_SIZE_CYCLE=512x288,960x540,...` sweeps sizes, `PT_LOCK30=0`, `PT_OVERLAY=1`, `PT_LIGHT_FULL=1`, `PT_PROBE_FULL=1`,
 `PT_VFX_FULL=1`, `PT_GBUFFER_EARLY=0`, `PT_GBUFFER_VARIANTS=0`, `PT_SHARPEN=0`, `PT_SHADOW_CACHE=0`, `PT_PROBE_CULL=0` turn single optimisations off for A/B runs.
 `PT_PIPELINE_CACHE=0` (no pipeline cache), `PT_GBUFFER_ASYNC=0` (G-buffer variants built in the frame), `PT_PROBE_LIST=0` (one box per probe),
-`PT_MODEL_OCCLUSION=0` (models behind occluders drawn too) likewise. Clocks for a run: `PT_GPU_MHZ=<n>`
+`PT_MODEL_OCCLUSION=0` (models behind occluders drawn too), `PT_POST_LEAN=0` (the post-processing's colour LUT pass, flare target and FSR 2
+exposure clear every frame, see Switch 2 below) likewise. Clocks for a run: `PT_GPU_MHZ=<n>`
 (a fixed GPU clock), `PT_MEM_MHZ=<n>` (memory), `PT_AUTO_CLOCK=1`, `PT_GPU_MAX_MHZ=<n>`, `PT_CLOCK_OUTSIDE=<MHz>,<s>` (a GPU clock set at
 start as if by the clock manager, handed back at `<s>`: Automatic has to notice and take over), `PT_CPU_OUTSIDE=<MHz>` (a CPU clock set at
 start the same way: Automatic's CPU floor), `PT_CPU_MAX_MHZ=<n>`; sweeps that log the GPU time per step (12 s each from
@@ -222,6 +223,15 @@ final pass at 1080p 9.1 ms, the rest of the scene at 640x360 about 10 ms, 45-48 
 reprojection kernel; not measured on the console since). It is off
 with LSFG frame generation, which keeps its own fixed size. The log prints the split every 10 s (`fsr2: <render> -> <output> | inputs, FSR 2
 and the final pass | scene gpu and its passes`).
+
+**Post-processing (Switch 2).** With FSR 2 after the post-processing, nothing runs between the tonemap and the colour LUT except depth of
+field and motion blur (both scripted): on every other frame the tonemap pass applies the LUT itself, one full-screen pass at the render size
+fewer (the LUT then grades the tonemapped colour before it is stored in 8 bits rather than after: at most one step of 255 apart). The lens
+flare target (16-bit float, the render size) was cleared every frame and read by every tonemap pixel; it is now cleared and read only on
+frames that draw a flare. FSR 2's 1x1 exposure input, always 1 after the post-processing, is cleared once instead of a clear and two
+barriers a frame. The colour banding canceller (cutscenes) takes its four depth texels per tap with one gather instead of four fetches.
+`PT_POST_LEAN=0` puts the LUT pass, the flare clear and the exposure clear back for A/B runs (the gather has no switch). Not measured on
+the console yet.
 
 FSR 2's Vulkan shaders are normally made by AMD's `FidelityFX_SC.exe` (Windows only); `tools/fsr2_vk_shaders.py` compiles them with glslc
 into the same permutation headers, for the permutations the engine creates (render-size motion vectors without jitter, reversed-Z

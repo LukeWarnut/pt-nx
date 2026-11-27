@@ -461,6 +461,15 @@ void VfxPass::RecordForward(const SceneVfxContext& context) {
     }
 }
 
+bool VfxPass::HasFilterDraws(uint32_t layers) const {
+    if (list_.draws.empty() || !device_) {
+        return false;
+    }
+    return std::any_of(list_.draws.begin(), list_.draws.end(), [&](const vfx::Draw& d) {
+        return (d.layer == vfx::Layer::Flare && (layers & 1u) != 0u) || (d.layer == vfx::Layer::Screen && (layers & 2u) != 0u);
+    });
+}
+
 void VfxPass::RecordFilter(const SceneFilterContext& context) {
     if (list_.draws.empty() || !device_ || !context.depth_view) {
         return;
