@@ -84,7 +84,8 @@ public:
         bool calibrated = false;
     };
     const FrameTiming& Timing() const { return timing_; }
-    uint32_t swap_interval = 0;  // Switch: VBlanks per presented image (2 = locked 30 fps); 0 leaves the WSI's choice
+    // Switch: VBlanks per presented image (2 = locked 30 fps); 0 leaves the WSI's choice (1), and puts it back after a 2
+    uint32_t swap_interval = 0;
 
     void SetGrainNoise(VkImageView view);
 
@@ -93,6 +94,11 @@ public:
     static constexpr VkExtent2D kHudExtent{1920, 1080};
 
 private:
+    // Switch: the swap interval last set on the window (0: none yet). The window keeps it until it is set again (or a new swapchain resets it
+    // to 1), so turning the 30 fps lock or frame generation off has to set 1 itself.
+#ifdef PT_SWITCH
+    uint32_t window_interval_ = 0;
+#endif
     struct Frame {
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd = VK_NULL_HANDLE;

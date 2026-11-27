@@ -110,6 +110,7 @@ extern "C" void pt_switch_restore_mem_mhz(unsigned mhz);
 extern "C" unsigned pt_switch_cpu_rates(unsigned* out_mhz, unsigned max);
 extern "C" unsigned pt_switch_set_cpu_mhz(unsigned mhz);
 extern "C" void pt_switch_release_cpu_clock();
+extern "C" bool pt_switch_docked();
 
 // GPU clock control: see ReadSwitchClockConfig
 struct SwitchClockConfig {
@@ -167,20 +168,25 @@ constexpr int kSwitchLevels = static_cast<int>(sizeof(kSwitchSizes) / sizeof(kSw
 #define PT_SWITCH_FSR2 1
 #endif
 bool SwitchFsr2Active();
-// FSR 2's output on the Switch 2: the screen's size, at most 1920x1080 (a 4K TV gets 1080p, scaled up by the final pass like before)
+int SwitchFsr2OutputHeight();
+// FSR 2's output on the Switch 2: the screen's size, fitted into a 16:9 box of the output height setting (fsr2_output; Auto: 720p handheld,
+// 1080p docked). The composite scales it to the screen, as it scales the scene without FSR 2. FSR 2's accumulate pass and the final screen
+// pass run at this size, so it is most of FSR 2's cost: at 1080p handheld they took 9.1 ms of a 21 ms frame.
 VkExtent2D SwitchOutputSize() {
     int w = 1920;
     int h = 1080;
     SDL_GetWindowSizeInPixels(nullptr, &w, &h);
     w = std::max(w, 2);
     h = std::max(h, 2);
-    if (w > 1920 || h > 1080) {
-        if (static_cast<int64_t>(w) * 1080 >= static_cast<int64_t>(h) * 1920) {
-            h = static_cast<int>(static_cast<int64_t>(h) * 1920 / w) & ~1;
-            w = 1920;
+    const int box_h = SwitchFsr2OutputHeight();
+    const int box_w = box_h * 16 / 9;
+    if (w > box_w || h > box_h) {
+        if (static_cast<int64_t>(w) * box_h >= static_cast<int64_t>(h) * box_w) {
+            h = static_cast<int>(static_cast<int64_t>(h) * box_w / w) & ~1;
+            w = box_w;
         } else {
-            w = static_cast<int>(static_cast<int64_t>(w) * 1080 / h) & ~1;
-            h = 1080;
+            w = static_cast<int>(static_cast<int64_t>(w) * box_h / h) & ~1;
+            h = box_h;
         }
     }
     return {static_cast<uint32_t>(w), static_cast<uint32_t>(h)};
@@ -230,9 +236,22 @@ struct SwitchGfx {
     bool fsr2 = true;          // Switch 2: FSR 2 upscales the scene (the dynamic size) to the screen, 1080p at most; it is the anti-aliasing too
     float fsr2_sharpness = 0.0f;  // FSR 2's own sharpening (RCAS): an extra pass at the output size (~1 ms at 561 MHz), off by default (the
                                   // final screen pass's clarity sharpens already)
+    int fsr2_output = 0;       // FSR 2's output height: 0 Auto (720 handheld, 1080 docked), else 720, 900 or 1080 (fsr2_output= in switch.ini)
 #endif
 };
 SwitchGfx g_switch_gfx;
+#ifdef PT_SWITCH_FSR2
+constexpr int kFsr2Outputs[] = {0, 720, 900, 1080};
+#endif
+int SwitchFsr2OutputHeight() {
+#ifdef PT_SWITCH_FSR2
+    if (g_switch_gfx.fsr2_output > 0) return g_switch_gfx.fsr2_output;
+    // handheld: the 1080p panel gets 720p from FSR 2 (2x from 640x360) and the composite's scaling; docked: the GPU runs 1007 MHz, not 561
+    return pt_switch_docked() ? 1080 : 720;
+#else
+    return 1080;
+#endif
+}
 // FSR 2 runs when it is built in and chosen, and not with LSFG frame generation (that path keeps the scene at a fixed size of its own)
 bool SwitchFsr2Active() {
 #ifdef PT_SWITCH_FSR2
@@ -1373,6 +1392,7 @@ void SaveSwitchConfig() {
 #ifdef PT_SWITCH_FSR2
     out << "fsr2=" << (g_switch_gfx.fsr2 ? 1 : 0) << "\n";
     out << "fsr2_sharpness=" << g_switch_gfx.fsr2_sharpness << "\n";
+    out << "fsr2_output=" << g_switch_gfx.fsr2_output << "\n";
 #endif
 }
 
@@ -1445,15 +1465,27 @@ void ApplyFidelity(App& app, bool on) {
 }
 
 // Frame generation: each rendered frame is shown after one generated between it and the previous (two images, one VBlank each). It needs the 30 fps
-// pacing and a fixed scene size (the generator is built for one size), so the lock goes on and the adaptive size off.
+// pacing and a fixed scene size (the generator is built for one size), so the lock goes on and the adaptive size off. Turning it off puts both
+// back as they were before it (after a restart with it on, to the defaults: the lock's default, the adaptive size on).
 void ApplyFrameGen(App& app, bool on) {
+    static bool lock30_before = kSwitchLock30Default;
+    static bool dynamic_before = true;
+    if (on && !g_switch_gfx.frame_gen) {
+        lock30_before = g_switch_gfx.lock30;
+        dynamic_before = g_switch_gfx.dynamic;
+    }
+    const bool was_on = g_switch_gfx.frame_gen;
     g_switch_gfx.frame_gen = on;
     app.renderer.SetFrameGeneration(on);
     pt_switch_lsfg_set_flow(g_switch_gfx.lsfg_flow);
     if (on) {
         g_switch_gfx.lock30 = true;
         g_switch_gfx.dynamic = false;
+    } else if (was_on) {
+        g_switch_gfx.lock30 = lock30_before;
+        g_switch_gfx.dynamic = dynamic_before;
     }
+    pt::LogInfo("switch: frame generation {}, lock30 {}, dynamic {}", on ? "on" : "off", g_switch_gfx.lock30, g_switch_gfx.dynamic);
     SaveSwitchConfig();
 }
 
@@ -1506,7 +1538,7 @@ void DrawSwitchSection(App& app) {
     }
 #ifdef PT_SWITCH_FSR2
     ImGui::BeginDisabled(g_switch_gfx.frame_gen);
-    ImGui::Checkbox("FSR 2 upscaling (to the screen, 1080p at most)", &g_switch_gfx.fsr2);
+    ImGui::Checkbox("FSR 2 upscaling", &g_switch_gfx.fsr2);
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
         ImGui::SetTooltip(g_switch_gfx.frame_gen ? "Not with frame generation (it keeps the scene at a fixed size of its own)."
@@ -1514,6 +1546,26 @@ void DrawSwitchSection(App& app) {
                                                     "It replaces the anti-aliasing below. Off: the scene is scaled to the screen by the final pass.");
     }
     ImGui::BeginDisabled(!SwitchFsr2Active());
+    {
+        // the output size: the main loop sees SwitchOutputSize change and sets the sizes again
+        auto output_label = [](int height) -> std::string {
+            if (height > 0) return std::format("{}p", height);
+            return std::format("Auto ({}p {})", pt_switch_docked() ? 1080 : 720, pt_switch_docked() ? "docked" : "handheld");
+        };
+        if (ImGui::BeginCombo("FSR 2 output", output_label(g_switch_gfx.fsr2_output).c_str())) {
+            for (int height : kFsr2Outputs) {
+                if (ImGui::Selectable(height > 0 ? output_label(height).c_str() : "Auto (720p handheld, 1080p docked)",
+                                      height == g_switch_gfx.fsr2_output)) {
+                    g_switch_gfx.fsr2_output = height;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("The size FSR 2 rebuilds; the screen composite scales it to the screen.\n"
+                              "FSR 2 and the final screen pass cost about as much as their output's pixels: 1080p is 2.25x 720p.");
+        }
+    }
     ImGui::SliderFloat("FSR 2 sharpening", &g_switch_gfx.fsr2_sharpness, 0.0f, 1.0f, "%.2f");
     ImGui::EndDisabled();
 #endif
@@ -5798,6 +5850,9 @@ void ReadSwitchClockConfig(int& argc, char** argv) {
 #ifdef PT_SWITCH_FSR2
             else if (key == "fsr2") g_switch_gfx.fsr2 = value != 0;
             else if (key == "fsr2_sharpness") g_switch_gfx.fsr2_sharpness = std::clamp(std::strtof(line.c_str() + eq + 1, nullptr), 0.0f, 1.0f);
+            else if (key == "fsr2_output" &&
+                     std::find(std::begin(kFsr2Outputs), std::end(kFsr2Outputs), static_cast<int>(value)) != std::end(kFsr2Outputs))
+                g_switch_gfx.fsr2_output = static_cast<int>(value);
 #endif
             else if (key == "size" || key == "level") {
                 // size=WxH; the old level=N indexed the earlier 7-size list
@@ -5968,6 +6023,10 @@ int main(int argc, char** argv) {
     if (const char* overlay = std::getenv("PT_OVERLAY")) g_switch_gfx.overlay = std::atoi(overlay) != 0;
 #ifdef PT_SWITCH_FSR2
     if (const char* fsr2 = std::getenv("PT_FSR2")) g_switch_gfx.fsr2 = std::atoi(fsr2) != 0;  // test override of switch.ini (A/B runs)
+    if (const char* output = std::getenv("PT_FSR2_OUTPUT")) {  // likewise the output height (0 Auto, 720, 900, 1080)
+        const int height = std::atoi(output);
+        if (std::find(std::begin(kFsr2Outputs), std::end(kFsr2Outputs), height) != std::end(kFsr2Outputs)) g_switch_gfx.fsr2_output = height;
+    }
 #endif
 #endif
 #ifdef _WIN32

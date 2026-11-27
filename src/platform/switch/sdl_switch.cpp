@@ -1151,6 +1151,15 @@ static s32 GpuRateList(u32* out, s32 max) {
     return n;
 }
 
+// whether the console is docked (the Switch 2's FSR 2 output size follows it: main.cpp, SwitchFsr2OutputHeight)
+extern "C" bool pt_switch_docked() {
+#ifdef __SWITCH2__
+    return g_docked;  // what CheckScreenSize saw on the last event pump, so it changes together with the screen size
+#else
+    return appletGetOperationMode() == AppletOperationMode_Console;
+#endif
+}
+
 extern "C" unsigned pt_switch_set_gpu_mhz(unsigned mhz) {
     if (!EnsureClocks()) return 0;
     u32 rates[40] = {};

@@ -195,8 +195,19 @@ offers no CPU or memory rate list (the CPU runs 1100 MHz, the memory 2133 MHz).
 **FSR 2 (Switch 2).** The console's DLSS is not reachable from homebrew (it ships inside each game through Nintendo's SDK and NVN, and
 ouncevk is Mesa's open NVK driver), so the Switch 2 build upscales with AMD FidelityFX Super Resolution 2.2.1, compiled from source
 (`switch/CMakeLists.txt`, target `pt_fsr2`; `-DPT_FSR2=OFF` leaves it out). With it on (the default, Minus menu "FSR 2 upscaling",
-`fsr2=` in `switch.ini`, `PT_FSR2=0/1` for A/B runs) the renderer works at the output size, the screen's size capped at 1920x1080 (a 4K
-TV gets 1080p, scaled by the final pass), and the scene renders at the dynamic resolution's size, which FSR 2 upscales to it every frame.
+`fsr2=` in `switch.ini`, `PT_FSR2=0/1` for A/B runs) the renderer works at the output size and the scene renders at the dynamic
+resolution's size, which FSR 2 upscales to it every frame. The output size is the screen's, fitted into a 16:9 box of the **FSR 2 output**
+setting (Minus menu, `fsr2_output=` in `switch.ini`: 0 Auto, 720, 900, 1080; `PT_FSR2_OUTPUT` for A/B runs). Auto is **720p handheld** and
+1080p docked; the screen composite scales the output to the screen, as it scales the scene without FSR 2 (a 4K TV likewise gets 1080p).
+FSR 2's accumulate pass and the final screen pass run at the output size, so they cost about its pixel count: 1080p is 2.25x 720p, and
+at 1080p handheld they were 9.1 ms of a 21 ms frame (48 fps at 640x360, against 60 fps at 736x414 without FSR 2). At 720p a 640x360 scene
+is a 2x upscale, FSR 2's Performance ratio, instead of 3x.
+
+FSR 2's history reprojection is compiled with AMD's approximate Lanczos kernel (`tools/fsr2_vk_shaders.py`, `REPROJECT_LANCZOS_NO_LUT`).
+FSR 2's Vulkan backend chooses the Lanczos lookup table only on GPUs with wave64. Everywhere else, NVIDIA included, AMD's build uses the
+reference kernel: two `sin()` and two divisions per weight, for the history and the lock status, in the output-size accumulate pass
+(40 `sin` and 61 divisions in its SPIR-V, against none and 21 with the approximation). Those run on the special function units, a quarter of
+the FMA rate. The approximation is the polynomial FSR 2 already uses for its upsampling.
 FSR 2 runs **after** the post-processing (`SceneRenderer::upscale_after_post`): the scene and every post-processing pass stay at the render
 size, FSR 2 takes the tonemapped image (its non-HDR mode), and only FSR 2 and the final screen pass (distortion, clarity, dither,
 screen-layer effects) run at the output size. The first version ran FSR 2 before the post-processing, the desktop upscalers' order, and that
@@ -207,15 +218,15 @@ The dynamic resolution steps between the output size (FSR 2 as anti-aliasing onl
 ratio), with the same 14 ms scene budget for 60 fps; FSR 2 and the final pass count as a fixed cost in its model. A size change keeps the FSR 2 context (it is created for every render size up to the output) and does not wait for the GPU.
 FSR 2 replaces the TAA/SMAA/FXAA choice while it is on; "FSR 2 sharpening" (`fsr2_sharpness=`, default 0: it is one more pass at the output
 size, and the final pass's clarity sharpens already) is its RCAS pass. Measured handheld at 561 MHz (before the clock fix): FSR 2 and the
-final pass at 1080p 9.1 ms, the rest of the scene at 640x360 about 10 ms, 45-48 fps. It is off
+final pass at 1080p 9.1 ms, the rest of the scene at 640x360 about 10 ms, 45-48 fps (before the 720p handheld output and the approximate
+reprojection kernel; not measured on the console since). It is off
 with LSFG frame generation, which keeps its own fixed size. The log prints the split every 10 s (`fsr2: <render> -> <output> | inputs, FSR 2
 and the final pass | scene gpu and its passes`).
 
 FSR 2's Vulkan shaders are normally made by AMD's `FidelityFX_SC.exe` (Windows only); `tools/fsr2_vk_shaders.py` compiles them with glslc
 into the same permutation headers, for the permutations the engine creates (render-size motion vectors without jitter, reversed-Z
 infinite depth; HDR colour, the Lanczos LUT and sharpening both ways; 32-bit only, the 16-bit key maps to the 32-bit shaders).
-`src/platform/switch/fsr2/ffx_compat.h` supplies the MSVC helpers its runtime uses. Not measured on the console yet: FSR 2's own cost at
-1080p and the output-size post-processing decide how small the scene has to get for 60 fps.
+`src/platform/switch/fsr2/ffx_compat.h` supplies the MSVC helpers its runtime uses.
 
 ## Known gaps
 

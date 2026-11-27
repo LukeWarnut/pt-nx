@@ -10,7 +10,8 @@ glslc and its own SPIR-V reflection.
 Only the permutations the engine creates are compiled (switch/README.md, FSR 2): render-resolution
 motion vectors without jitter, inverted (reversed-Z) depth. HDR colour input (FSR 2 before the
 post-processing) or not (after it, the Switch 2's order), the Lanczos LUT and the sharpening bits are
-compiled both ways; FP16 is not (the 16-bit key bit maps to the 32-bit shaders:
+compiled both ways (without the LUT the reprojection uses AMD's approximate Lanczos, not the reference
+kernel: REPROJECT_LANCZOS_NO_LUT); FP16 is not (the 16-bit key bit maps to the 32-bit shaders:
 NVIDIA's accumulate pass drops it anyway, and fewer shader paths go through ouncevk's compiler). Every
 other key maps to the compiled shader with the same HDR, LUT and sharpening bits, so the backend must be
 created with exactly the flags above (fsr2_backend.cpp does).
@@ -62,6 +63,11 @@ BASE_DEFINES = {
     "FFX_FSR2_OPTION_POSTPROCESSLOCKSTATUS_SAMPLERS_USE_DATA_HALF": 0,
     "FFX_FSR2_OPTION_UPSAMPLE_USE_LANCZOS_TYPE": 2,
 }
+# The history reprojection's Lanczos when the key's LUT bit is clear. The backend clears it on every GPU without wave64 (all of NVIDIA's,
+# the Switch 2's included), and AMD's build then uses the reference kernel (type 0): two sin() and two divisions per weight, 4x4 taps for
+# the history and again for the lock status, at the output size, all on the special function units (a quarter of the FMA rate on NVIDIA).
+# Type 2 is AMD's polynomial approximation of the same kernel (FMAs only), the one the upsampling already uses (BASE_DEFINES).
+REPROJECT_LANCZOS_NO_LUT = 2
 
 
 def compile_pass(glslc, src, name, defines):
@@ -201,7 +207,9 @@ def main():
                     defines = dict(BASE_DEFINES)
                     defines.update(FIXED)
                     defines["FFX_FSR2_OPTION_HDR_COLOR_INPUT"] = hdr
-                    defines["FFX_FSR2_OPTION_REPROJECT_USE_LANCZOS_TYPE"] = lut
+                    # the key's bit: 1 the LUT, 0 (what the backend picks on NVIDIA, no wave64) AMD's approximation instead of the reference
+                    # (see REPROJECT_LANCZOS_NO_LUT)
+                    defines["FFX_FSR2_OPTION_REPROJECT_USE_LANCZOS_TYPE"] = 1 if lut else REPROJECT_LANCZOS_NO_LUT
                     defines["FFX_FSR2_OPTION_APPLY_SHARPENING"] = sharpen
                     spirv = compile_pass(args.glslc, args.src, name, defines)
                     digest = hashlib.sha256(spirv).hexdigest()

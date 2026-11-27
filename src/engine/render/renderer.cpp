@@ -860,9 +860,13 @@ void Renderer::EndFrame(bool draw_ui) {
         present.pImageIndices = &image_index_;
         streamline::SetMarker(streamline::Marker::PresentStart);
 #ifdef PT_SWITCH
-        const uint32_t interval = fg_follow ? 1u : swap_interval;  // frame generation: each of the frame's two images stays one VBlank
+        uint32_t interval = fg_follow ? 1u : swap_interval;  // frame generation: each of the frame's two images stays one VBlank
+        if (interval == 0 && window_interval_ > 1) {
+            interval = 1;  // the lock was turned off: the window still holds its 2, put the default back (once; 0 otherwise leaves the WSI's)
+        }
         if (interval > 0) {
             pt_switch_set_swap_interval(interval);
+            window_interval_ = interval;
         }
 #endif
         const auto present_start = std::chrono::steady_clock::now();
@@ -944,6 +948,7 @@ void Renderer::EndFrame(bool draw_ui) {
             present2.pImageIndices = &index2;
 #ifdef PT_SWITCH
             pt_switch_set_swap_interval(1);
+            window_interval_ = 1;
 #endif
             const auto present_start = std::chrono::steady_clock::now();
             const VkResult result = ctx_.QueuePresent(present2);
